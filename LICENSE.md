@@ -39,7 +39,7 @@ The brand name "MyClaw" is OpenClaw Foundation's product name and is not license
 
 ## Irrevocability
 
-This gift is **irrevocable**. Once published under CC BY 4.0, the licence cannot be withdrawn for content already released. See [`IRREVOCABLE-LICENCE-DECLARATION.md`](IRREVOCABLE-LICENCE-DECLARATION.md) in the parent gift-surface repository [`UniCORE`](https://github.com/bryanunitek/UniCORE) for the canonical statement of irrevocability that applies across the entire UniCORE family.
+This gift is **irrevocable**. Once published under CC BY 4.0, the licence cannot be withdrawn for content already released. See [`IRREVOCABLE-LICENCE-DECLARATION.md`](IRREVOCABLE-LICENCE-DECLARATION.md) in the parent gift-surface repository [`UniCORE`](https://git.unitek-systems.com/UniCORE/UniCORE) (mirror: [GitHub](https://github.com/bryanunitek/UniCORE)) for the canonical statement of irrevocability that applies across the entire UniCORE family.
 
 ---
 

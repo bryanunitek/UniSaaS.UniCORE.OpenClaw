@@ -21,13 +21,13 @@ The full licence text is available at [https://creativecommons.org/licenses/by/4
 
 ## Dual-licence note
 
-This repository contains, or will contain once forked, an **upstream open-source codebase** licensed under its own terms (see [`LICENSE.upstream.md`](LICENSE.upstream.md)). The upstream codebase retains its original licence. UniCORE additions sit on top under CC BY 4.0.
+This repository contains, or will contain once forked, an **upstream open-source codebase** licensed under its own terms (see [`LICENSE.upstream.md`](https://git.unitek-systems.com/UniCORE/UniSaaS.UniCORE.OpenClaw/src/branch/main/LICENSE.upstream.md) (mirror: [GitHub](https://github.com/bryanunitek/UniSaaS.UniCORE.OpenClaw/blob/main/LICENSE.upstream.md))). The upstream codebase retains its original licence. UniCORE additions sit on top under CC BY 4.0.
 
-- **Upstream files** carry the upstream copyright header and are governed by [`LICENSE.upstream.md`](LICENSE.upstream.md).
+- **Upstream files** carry the upstream copyright header and are governed by [`LICENSE.upstream.md`](https://git.unitek-systems.com/UniCORE/UniSaaS.UniCORE.OpenClaw/src/branch/main/LICENSE.upstream.md) (mirror: [GitHub](https://github.com/bryanunitek/UniSaaS.UniCORE.OpenClaw/blob/main/LICENSE.upstream.md)).
 - **UniCORE-authored files** carry a `Copyright (c) Bryan Fred, Unitek Systems Limited` header and are governed by THIS file.
 - **Composite works** that combine both must respect both licences. CC BY 4.0 is compatible with MIT / Apache-2.0 / BSD upstream licences for this purpose.
 
-For the operational discipline that maintains this boundary across upstream merges, see [`UPSTREAM-MERGE-DISCIPLINE.md`](UPSTREAM-MERGE-DISCIPLINE.md).
+For the operational discipline that maintains this boundary across upstream merges, see [`UPSTREAM-MERGE-DISCIPLINE.md`](https://git.unitek-systems.com/UniCORE/UniSaaS.UniCORE.OpenClaw/src/branch/main/UPSTREAM-MERGE-DISCIPLINE.md) (mirror: [GitHub](https://github.com/bryanunitek/UniSaaS.UniCORE.OpenClaw/blob/main/UPSTREAM-MERGE-DISCIPLINE.md)).
 
 ---
 

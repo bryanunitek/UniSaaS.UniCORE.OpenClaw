@@ -25,7 +25,7 @@ If you want a personal, single-user assistant that feels local, fast, and always
 
 Supported channels include: WhatsApp, Telegram, Slack, Discord, Google Chat, Signal, iMessage, IRC, Microsoft Teams, Matrix, Feishu, LINE, Mattermost, Nextcloud Talk, Nostr, Synology Chat, Tlon, Twitch, Zalo, Zalo Personal, WeChat, QQ, WebChat.
 
-[Website](https://openclaw.ai) · [Docs](https://docs.openclaw.ai) · [Vision](VISION.md) · [Third-party notices](THIRD_PARTY_NOTICES.md) · [DeepWiki](https://deepwiki.com/openclaw/openclaw) · [Getting Started](https://docs.openclaw.ai/start/getting-started) · [Updating](https://docs.openclaw.ai/install/updating) · [Showcase](https://docs.openclaw.ai/start/showcase) · [FAQ](https://docs.openclaw.ai/help/faq) · [Onboarding](https://docs.openclaw.ai/start/wizard) · [Nix](https://github.com/openclaw/nix-openclaw) · [Docker](https://docs.openclaw.ai/install/docker) · [Discord](https://discord.gg/clawd)
+[Website](https://openclaw.ai) · [Docs](https://docs.openclaw.ai) · [Vision](https://git.unitek-systems.com/UniCORE/UniSaaS.UniCORE.OpenClaw/src/branch/main/VISION.md) (mirror: [GitHub](https://github.com/bryanunitek/UniSaaS.UniCORE.OpenClaw/blob/main/VISION.md)) · [Third-party notices](https://git.unitek-systems.com/UniCORE/UniSaaS.UniCORE.OpenClaw/src/branch/main/THIRD_PARTY_NOTICES.md) (mirror: [GitHub](https://github.com/bryanunitek/UniSaaS.UniCORE.OpenClaw/blob/main/THIRD_PARTY_NOTICES.md)) · [DeepWiki](https://deepwiki.com/openclaw/openclaw) · [Getting Started](https://docs.openclaw.ai/start/getting-started) · [Updating](https://docs.openclaw.ai/install/updating) · [Showcase](https://docs.openclaw.ai/start/showcase) · [FAQ](https://docs.openclaw.ai/help/faq) · [Onboarding](https://docs.openclaw.ai/start/wizard) · [Nix](https://github.com/openclaw/nix-openclaw) · [Docker](https://docs.openclaw.ai/install/docker) · [Discord](https://discord.gg/clawd)
 
 New install? Start here: [Getting started](https://docs.openclaw.ai/start/getting-started)
 
@@ -302,7 +302,7 @@ by Peter Steinberger and the community.
 
 ## Community
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines, maintainers, and how to submit PRs.
+See [CONTRIBUTING.md](https://git.unitek-systems.com/UniCORE/UniSaaS.UniCORE.OpenClaw/src/branch/main/CONTRIBUTING.md) (mirror: [GitHub](https://github.com/bryanunitek/UniSaaS.UniCORE.OpenClaw/blob/main/CONTRIBUTING.md)) for guidelines, maintainers, and how to submit PRs.
 AI/vibe-coded PRs welcome! 🤖
 
 Special thanks to [Mario Zechner](https://mariozechner.at/) for his support and for

@@ -1,4 +1,3 @@
-// Internal hook types define runtime hook event families and payload contracts.
 export type InternalHookEventType = "command" | "session" | "agent" | "gateway" | "message";
 
 const KNOWN_INTERNAL_HOOK_EVENT_FAMILIES = [
@@ -17,7 +16,7 @@ const KNOWN_INTERNAL_HOOK_EVENT_FAMILIES = [
  * barrel, so anything outside this set is flagged as a likely typo
  * (advisory), not rejected.
  */
-export const KNOWN_INTERNAL_HOOK_EVENT_KEYS = [
+const KNOWN_INTERNAL_HOOK_EVENT_KEYS = [
   "agent:bootstrap",
   "command:new",
   "command:reset",
@@ -29,6 +28,7 @@ export const KNOWN_INTERNAL_HOOK_EVENT_KEYS = [
   "message:received",
   "message:sent",
   "message:transcribed",
+  "session:auto-reset",
   "session:compact:after",
   "session:compact:before",
   "session:patch",
@@ -42,15 +42,11 @@ export function isKnownInternalHookEventKey(key: string): boolean {
 }
 
 export interface InternalHookEvent {
-  /** The type of event (command, session, agent, gateway, etc.) */
   type: InternalHookEventType;
   /** The specific action within the type (e.g., 'new', 'reset', 'stop') */
   action: string;
-  /** The session key this event relates to */
   sessionKey: string;
-  /** Additional context specific to the event */
   context: Record<string, unknown>;
-  /** Timestamp when the event occurred */
   timestamp: Date;
   /** Messages to send back to the user (hooks can push to this array) */
   messages: string[];

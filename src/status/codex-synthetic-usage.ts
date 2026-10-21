@@ -7,8 +7,8 @@ import type {
   UsageSummary,
 } from "../infra/provider-usage.types.js";
 
-export const CODEX_SYNTHETIC_USAGE_PROVIDER = "openai";
-export const CODEX_SYNTHETIC_USAGE_HOOK_PROVIDER = "codex";
+const CODEX_SYNTHETIC_USAGE_PROVIDER = "openai";
+const CODEX_SYNTHETIC_USAGE_HOOK_PROVIDER = "codex";
 
 /** Maps a provider auth label onto the usage credential type buckets. */
 export function resolveUsageCredentialType(
@@ -46,25 +46,24 @@ export function buildCodexSyntheticUsageAuth(
 export function shouldUseCodexSyntheticUsageForRuntime(params: {
   provider?: string;
   effectiveHarness?: string;
+  sessionHarnessId?: string;
 }): boolean {
   const harness = normalizeOptionalLowercaseString(params.effectiveHarness);
+  const sessionHarness = normalizeOptionalLowercaseString(params.sessionHarnessId);
   const provider = normalizeOptionalLowercaseString(params.provider);
   return (
-    harness === CODEX_SYNTHETIC_USAGE_HOOK_PROVIDER &&
+    (harness === CODEX_SYNTHETIC_USAGE_HOOK_PROVIDER ||
+      sessionHarness === CODEX_SYNTHETIC_USAGE_HOOK_PROVIDER) &&
     (provider === CODEX_SYNTHETIC_USAGE_PROVIDER || provider === "codex")
   );
 }
 
-function hasDisplayableUsageSnapshot(snapshot: ProviderUsageSnapshot): boolean {
-  return (
+function usageSnapshotRank(snapshot: ProviderUsageSnapshot): number {
+  if (
     snapshot.windows.length > 0 ||
     Boolean(snapshot.billing?.length) ||
     Boolean(snapshot.summary?.trim())
-  );
-}
-
-function usageSnapshotRank(snapshot: ProviderUsageSnapshot): number {
-  if (hasDisplayableUsageSnapshot(snapshot)) {
+  ) {
     return 2;
   }
   return snapshot.error ? 0 : 1;
@@ -75,10 +74,16 @@ function billingEntryKey(entry: ProviderUsageBilling): string {
   return [entry.type, entry.label ?? "", entry.unit, period].join("\0");
 }
 
-function mergeBilling(
-  preferred: ProviderUsageSnapshot,
-  secondary: ProviderUsageSnapshot,
-): ProviderUsageBilling[] | undefined {
+function mergeUsageSnapshots(
+  candidate: ProviderUsageSnapshot,
+  existing: ProviderUsageSnapshot,
+): ProviderUsageSnapshot {
+  const candidateRank = usageSnapshotRank(candidate);
+  const existingRank = usageSnapshotRank(existing);
+  const preferCandidate =
+    candidateRank >= existingRank && !(candidateRank === 0 && existingRank === 0);
+  const preferred = preferCandidate ? candidate : existing;
+  const secondary = preferCandidate ? existing : candidate;
   const entries = new Map<string, ProviderUsageBilling>();
   for (const entry of secondary.billing ?? []) {
     entries.set(billingEntryKey(entry), entry);
@@ -86,15 +91,7 @@ function mergeBilling(
   for (const entry of preferred.billing ?? []) {
     entries.set(billingEntryKey(entry), entry);
   }
-  return entries.size > 0 ? [...entries.values()] : undefined;
-}
-
-function mergeUsageSnapshots(
-  preferred: ProviderUsageSnapshot,
-  secondary: ProviderUsageSnapshot,
-): ProviderUsageSnapshot {
-  const billing = mergeBilling(preferred, secondary);
-  // Synthetic and OAuth sources can own different facts for the same provider.
+  const billing = entries.size > 0 ? [...entries.values()] : undefined;
   // Preserve complementary plan/billing data while the preferred source owns windows/errors.
   return {
     ...secondary,
@@ -129,18 +126,8 @@ export function mergeUsageSummaries(
       providersById.set(provider.provider, provider);
       continue;
     }
-    const providerRank = usageSnapshotRank(provider);
-    const existingRank = usageSnapshotRank(existing);
-    // Synthetic errors must not hide the concrete provider endpoint's error.
-    // Synthetic data still wins equal displayable ranks so its live windows stay authoritative.
-    const preferred =
-      providerRank === 0 && existingRank === 0
-        ? existing
-        : providerRank >= existingRank
-          ? provider
-          : existing;
-    const secondary = preferred === provider ? existing : provider;
-    providersById.set(provider.provider, mergeUsageSnapshots(preferred, secondary));
+    // Preserve concrete endpoint errors; synthetic data wins equal displayable ranks.
+    providersById.set(provider.provider, mergeUsageSnapshots(provider, existing));
   }
   return {
     updatedAt: base.updatedAt,

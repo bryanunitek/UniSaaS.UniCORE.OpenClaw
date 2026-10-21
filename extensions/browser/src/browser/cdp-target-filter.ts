@@ -7,6 +7,7 @@
 const BROWSER_INTERNAL_TARGET_URL_PREFIXES = [
   "chrome://",
   "chrome-untrusted://",
+  "chrome-extension://",
   "devtools://",
   "edge://",
   "brave://",
@@ -16,6 +17,7 @@ const BROWSER_INTERNAL_TARGET_URL_PREFIXES = [
 
 type BrowserTargetUrlLike = {
   url?: string | null;
+  type?: string | null;
 };
 
 /** Return true for browser-owned chrome/devtools/internal URLs. */
@@ -24,7 +26,7 @@ function isBrowserInternalTargetUrl(url: string | null | undefined): boolean {
   return BROWSER_INTERNAL_TARGET_URL_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
 
-/** Return true when a CDP target should be selectable by user-facing actions. */
+/** Return true when a CDP page target should be selectable by user-facing actions. */
 export function isSelectableCdpBrowserTarget(target: BrowserTargetUrlLike): boolean {
-  return !isBrowserInternalTargetUrl(target.url);
+  return target.type === "page" && !isBrowserInternalTargetUrl(target.url);
 }

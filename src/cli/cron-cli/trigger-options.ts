@@ -1,40 +1,88 @@
 // Client-side trigger script loading for cron create/edit commands.
-import fs from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import {
+  readByteStreamWithLimit,
+  type ReadByteStreamWithLimitOptions,
+} from "@openclaw/media-core/read-byte-stream-with-limit";
+import { CRON_JOB_SCRATCH_MAX_BYTES } from "../../cron/scratch-contract.js";
+import { isErrno } from "../../infra/errno.js";
+import { CronCliError } from "./cron-cli-error.js";
 
 const MAX_CRON_TRIGGER_SCRIPT_BYTES = 65_536;
 
-async function readStdin(stream: NodeJS.ReadableStream): Promise<string> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of stream) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    total += buffer.byteLength;
-    if (total > MAX_CRON_TRIGGER_SCRIPT_BYTES) {
-      throw new Error("Trigger script exceeds 65536 bytes");
-    }
-    chunks.push(buffer);
+function decodeCronInput(bytes: Buffer, label: string): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (error) {
+    throw new CronCliError(`${label} must be valid UTF-8`, { cause: error });
   }
-  return Buffer.concat(chunks, total).toString("utf8");
+}
+
+async function readCronInput(
+  source: string,
+  stdin: AsyncIterable<unknown> | undefined,
+  options: ReadByteStreamWithLimitOptions,
+): Promise<Buffer> {
+  const stream = source === "-" ? (stdin ?? process.stdin) : createReadStream(source);
+  try {
+    return await readByteStreamWithLimit(stream, options);
+  } catch (error) {
+    // Filesystem read failures are operator input errors; byte-stream contract
+    // violations and other unexpected exceptions keep their original identity.
+    if (
+      error instanceof Error &&
+      isErrno(error) &&
+      typeof error.errno === "number" &&
+      typeof error.syscall === "string"
+    ) {
+      throw new CronCliError(error);
+    }
+    throw error;
+  }
+}
+
+async function readScriptStream(
+  source: string,
+  stdin: AsyncIterable<unknown> | undefined,
+  label: string,
+): Promise<string> {
+  const bytes = await readCronInput(source, stdin, {
+    maxBytes: MAX_CRON_TRIGGER_SCRIPT_BYTES,
+    onOverflow: () => new CronCliError(`${label} exceeds ${MAX_CRON_TRIGGER_SCRIPT_BYTES} bytes`),
+  });
+  const script = decodeCronInput(bytes, label).trim();
+  if (!script) {
+    throw new CronCliError(`${label} must not be empty`);
+  }
+  return script;
 }
 
 /** Reads a trigger script locally before sending the cron RPC. */
 export async function readCronTriggerScript(
   source: string,
   deps?: {
-    readFile?: (path: string) => Promise<string>;
-    stdin?: NodeJS.ReadableStream;
+    stdin?: AsyncIterable<unknown>;
   },
 ): Promise<string> {
-  const raw =
-    source === "-"
-      ? await readStdin(deps?.stdin ?? process.stdin)
-      : await (deps?.readFile ?? ((path) => fs.readFile(path, "utf8")))(source);
-  if (Buffer.byteLength(raw, "utf8") > MAX_CRON_TRIGGER_SCRIPT_BYTES) {
-    throw new Error("Trigger script exceeds 65536 bytes");
-  }
-  const script = raw.trim();
-  if (!script) {
-    throw new Error("Trigger script must not be empty");
-  }
-  return script;
+  return await readScriptStream(source, deps?.stdin, "Trigger script");
+}
+
+/** Reads a script payload locally before sending the cron RPC. */
+export async function readCronPayloadScript(
+  source: string,
+  deps?: { stdin?: AsyncIterable<unknown> },
+): Promise<string> {
+  return await readScriptStream(source, deps?.stdin, "Script payload");
+}
+
+/** Reads exact scratch content locally; empty content is a meaningful value. */
+export async function readCronScratchContent(
+  source: string,
+  deps?: { stdin?: AsyncIterable<unknown> },
+): Promise<string> {
+  const bytes = await readCronInput(source, deps?.stdin, {
+    maxBytes: CRON_JOB_SCRATCH_MAX_BYTES,
+    onOverflow: () => new CronCliError(`Cron scratch exceeds ${CRON_JOB_SCRATCH_MAX_BYTES} bytes`),
+  });
+  return decodeCronInput(bytes, "Cron scratch");
 }

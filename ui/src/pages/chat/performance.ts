@@ -1,8 +1,9 @@
 import type { EventLogEntry } from "../../api/event-log.ts";
+import type { RenderLifecycle } from "./render-lifecycle.ts";
 
 type ChatPerformanceHost = {
   eventLogBuffer?: unknown[];
-  updateComplete?: Promise<unknown>;
+  renderLifecycle?: RenderLifecycle;
 };
 
 const EVENT_LOG_LIMIT = 250;
@@ -17,64 +18,77 @@ export function roundedControlUiDurationMs(durationMs: number): number {
   return Math.max(0, Math.round(durationMs));
 }
 
-function runAfterPaint(callback: () => void): void {
-  if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
-    queueMicrotask(callback);
-    return;
-  }
-  window.requestAnimationFrame(() => window.requestAnimationFrame(callback));
-}
-
-function keepLatestBufferedEventsForType(
-  entries: unknown[],
-  event: string,
-  maxExistingForType: number,
-): unknown[] {
-  let keptForType = 0;
-  return entries.filter((entry) => {
-    if (
-      !entry ||
-      typeof entry !== "object" ||
-      !("event" in entry) ||
-      (entry as { event?: unknown }).event !== event
-    ) {
-      return true;
+function runAfterPaint(callback: () => void, complete: () => void): () => void {
+  let active = true;
+  let frame: number | null = null;
+  const run = () => {
+    if (!active) {
+      return;
     }
-    keptForType += 1;
-    return keptForType <= maxExistingForType;
-  });
+    active = false;
+    try {
+      callback();
+    } finally {
+      complete();
+    }
+  };
+  if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+    queueMicrotask(run);
+  } else {
+    frame = window.requestAnimationFrame(() => {
+      frame = null;
+      if (!active) {
+        return;
+      }
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        run();
+      });
+    });
+  }
+  return () => {
+    if (!active) {
+      return;
+    }
+    active = false;
+    if (frame !== null) {
+      window.cancelAnimationFrame(frame);
+      frame = null;
+    }
+  };
 }
 
 export function recordControlUiPerformanceEvent(
   host: ChatPerformanceHost,
   event: string,
   payload: Record<string, unknown>,
-  opts?: { warn?: boolean; console?: boolean; maxBufferedEventsForType?: number },
+  opts: { warn?: boolean; maxBufferedEventsForType: number },
 ): void {
-  const entry: EventLogEntry = { ts: Date.now(), event, payload };
-  if (Array.isArray(host.eventLogBuffer)) {
-    const existingBuffer =
-      typeof opts?.maxBufferedEventsForType === "number"
-        ? keepLatestBufferedEventsForType(
-            host.eventLogBuffer,
-            event,
-            Math.max(0, opts.maxBufferedEventsForType - 1),
-          )
-        : host.eventLogBuffer;
-    host.eventLogBuffer = [entry, ...existingBuffer].slice(0, EVENT_LOG_LIMIT);
+  const newEntry: EventLogEntry = { ts: Date.now(), event, payload };
+  if (host.eventLogBuffer) {
+    let keptForType = 0;
+    const existingBuffer = host.eventLogBuffer.filter((entry) => {
+      if (!entry || typeof entry !== "object" || !("event" in entry) || entry.event !== event) {
+        return true;
+      }
+      keptForType += 1;
+      return keptForType < opts.maxBufferedEventsForType;
+    });
+    host.eventLogBuffer = [newEntry, ...existingBuffer].slice(0, EVENT_LOG_LIMIT);
   }
-  if (opts?.console === false) {
-    return;
+  if (opts.warn) {
+    console.warn(`[openclaw] ${event}`, payload);
   }
-  const logger = opts?.warn === true ? console.warn : console.debug;
-  logger(`[openclaw] ${event}`, payload);
 }
 
 export function scheduleControlUiAfterPaint(
-  host: Pick<ChatPerformanceHost, "updateComplete">,
+  host: Pick<ChatPerformanceHost, "renderLifecycle">,
   callback: () => void,
 ): void {
-  void Promise.resolve(host.updateComplete)
-    .catch(() => undefined)
-    .then(() => runAfterPaint(callback));
+  if (host.renderLifecycle) {
+    host.renderLifecycle.afterCommit((complete) => runAfterPaint(callback, complete));
+    return;
+  }
+  // Renderer-free unit hosts have no DOM commit to await.
+  runAfterPaint(callback, () => undefined);
 }

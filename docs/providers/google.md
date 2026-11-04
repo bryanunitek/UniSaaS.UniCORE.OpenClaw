@@ -145,7 +145,7 @@ the Gateway already runs inside a managed Google Cloud environment.
   </Tab>
 
   <Tab title="Gemini CLI runtime">
-    **Advanced use only:** run a canonical `google/*` model through an installed
+    **Advanced use only:** run a standard `google/*` model through an installed
     Gemini CLI while keeping authentication on the supported AI Studio API-key
     path.
 
@@ -175,7 +175,7 @@ the Gateway already runs inside a managed Google Cloud environment.
         common Windows/npm layouts.
       </Step>
       <Step title="Select the CLI runtime">
-        Keep the canonical Google model ref and opt that model into the CLI
+        Keep the standard Google model ref and opt that model into the CLI
         runtime:
 
         ```json5
@@ -197,7 +197,7 @@ the Gateway already runs inside a managed Google Cloud environment.
 
     - Runtime: `google-gemini-cli`
     - Auth: selected Google AI Studio API-key profile
-    - Model refs: canonical `google/*`
+    - Model refs: `google/*`
 
     `google-gemini-cli` is the CLI backend the bundled Google plugin registers.
     See [CLI backends](/gateway/cli-backends) for its argv, JSONL dialect, and
@@ -220,7 +220,7 @@ the Gateway already runs inside a managed Google Cloud environment.
 
 ## Gemini 4 Argon
 
-`google/gemini-4-argon` is available in the bundled catalog, with a 1,048,576-token
+`google/gemini-4-argon` is the default Google model, with a 1,048,576-token
 context window and up to 65,536 output tokens. `google/gemini-4` is its shorthand;
 the same model ID and shorthand are available for `google-vertex`.
 
@@ -228,6 +228,11 @@ Gemini 4 Argon supports text, image, audio, video, and PDF inputs, function
 calling, structured outputs, and search grounding. It uses implicit context
 caching only: explicit `cachedContents` handles and the Live API are not
 supported. See [Google's model documentation](https://ai.google.dev/gemini-api/docs/models/gemini-4-argon).
+
+The bundled catalog also includes the stable `google/gemini-3.8-flash`, with a
+1,048,576-token context window and up to 65,536 output tokens. The built-in
+`gemini-flash` alias selects this model; `gemini-flash-lite` selects
+`google/gemini-3.5-flash-lite`.
 
 ## Capabilities
 
@@ -249,13 +254,6 @@ Responses marked `MAX_TOKENS` or `CONTINUATION` reached a generation limit.
 OpenClaw preserves their partial content and reports a length-limited result.
 Function calls in that partial response remain incomplete instead of becoming
 an executable tool-use turn.
-
-The managed Gemini and Vertex transports stop reading when a compatible proxy
-sends `data: [DONE]`, release the response body, and ignore later frames. A valid
-candidate finish reason is still required for a successful result. First-frame
-quota errors participate in API-key rotation. For Gemini's first-response retry,
-usage metadata, response IDs, and empty or unspecified finish states do not count
-as generated output or disable the existing retry deadline.
 
 ## Web search
 
@@ -445,7 +443,7 @@ Kore: It is waiting at the maintainer gate.
 Gemini 3.1 and 2.5 preview TTS still use `generateContent`. Those models keep
 the older behavior: `audioProfile` is prepended to the transcript, and
 expressive tags use square brackets such as `[whispers]`. An unknown
-`gemini-3.8-*-tts` id fails closed instead of being sent to `generateContent`.
+`gemini-3.8-*-tts` id is rejected instead of being sent to `generateContent`.
 
 For lowest-latency spoken conversations, use the Google realtime voice provider
 backed by the Gemini Live API instead of batch TTS.

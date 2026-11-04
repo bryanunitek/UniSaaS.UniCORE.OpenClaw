@@ -38,8 +38,10 @@ import {
   assertOriginalServiceStateCompatible,
   revalidateOriginalManagedServiceRuntime,
 } from "./update-command-original-service.js";
-import { POST_PLUGIN_DOCTOR_EXECUTION_FAILED_REASON } from "./update-command-post-plugin-validation.js";
-import { verifyPreviousGatewayForUpdate } from "./update-command-readiness.js";
+import {
+  observeUpdateGatewayReadiness,
+  verifyPreviousGatewayForUpdate,
+} from "./update-command-readiness.js";
 import { UpdateCommandRecoveryPendingError } from "./update-command-recovery-error.js";
 import {
   isPackageManagerUpdateMode,
@@ -68,6 +70,7 @@ export async function recoverLaunchAgentAndRecheckGatewayHealth(params: {
   service: GatewayService;
   port: number;
   timeoutMs?: number;
+  onProgress?: (stage: string, reason: string) => void;
   expectedVersion?: string;
   expectedBuildId?: string;
   env?: NodeJS.ProcessEnv;
@@ -77,6 +80,7 @@ export async function recoverLaunchAgentAndRecheckGatewayHealth(params: {
 }> {
   const executor = params.updateRun?.executorFence;
   const assertCurrent = () => {
+    params.updateRun?.deadline?.signal.throwIfAborted();
     executor?.assertCurrent();
     params.assertCurrent?.();
   };
@@ -97,6 +101,7 @@ export async function recoverLaunchAgentAndRecheckGatewayHealth(params: {
       const recovery = await recoverInstalledLaunchAgentAfterUpdate({
         onGatewayStartAttempted: params.onGatewayStartAttempted,
         service: params.service,
+        deadline: params.updateRun?.deadline,
         env: params.env,
         assertCurrent: assertRecovery,
       });
@@ -106,7 +111,7 @@ export async function recoverLaunchAgentAndRecheckGatewayHealth(params: {
   );
   assertCurrent();
   // Native repair can succeed while readiness still fails; retain both observed outcomes.
-  if (launchAgentRecovery.attempted && params.updateRun) {
+  if (launchAgentRecovery.status !== "not-needed" && params.updateRun) {
     const endedAtMs = Date.now();
     const { runId, env } = params.updateRun;
     const repair = getUpdateRun(runId, { env })?.repair ?? [];
@@ -114,29 +119,35 @@ export async function recoverLaunchAgentAndRecheckGatewayHealth(params: {
       runId,
       {
         attempt: Math.max(0, ...repair.map((entry) => entry.attempt)) + 1,
-        status: launchAgentRecovery.recovered ? "succeeded" : "failed",
+        status: launchAgentRecovery.status === "recovered" ? "succeeded" : "failed",
         startedAtMs,
         endedAtMs,
-        summary: launchAgentRecovery.recovered
-          ? launchAgentRecovery.message
-          : launchAgentRecovery.detail,
+        summary:
+          launchAgentRecovery.status === "recovered"
+            ? launchAgentRecovery.message
+            : launchAgentRecovery.detail,
       },
       { env },
     );
   }
-  if (!launchAgentRecovery.recovered) {
+  if (launchAgentRecovery.status !== "recovered") {
     return { health: params.health, launchAgentRecovery };
   }
 
   const health = await waitForGatewayHealthyRestart({
     service: params.service,
     port: params.port,
-    timeoutMs: params.timeoutMs,
+    timeoutMs: params.updateRun?.deadline?.remainingMs() ?? params.timeoutMs,
+    deadline: params.updateRun?.deadline,
+    signal: params.updateRun?.deadline?.signal,
     expectedVersion: params.expectedVersion,
     ...(params.expectedBuildId ? { expectedBuildId: params.expectedBuildId } : {}),
     requirePluginHealth: false,
     requireChannelHealth: false,
     env: params.env,
+    onObservation: params.onProgress
+      ? (snapshot) => params.onProgress?.("recovery", renderRestartDiagnostics(snapshot).join("; "))
+      : undefined,
     supervisorKeepsAlive: true,
     settle: { probes: 12 },
   });
@@ -217,19 +228,12 @@ export async function admitInstalledGatewayRecovery(
   }
   const settlement = result.steps.findLast((step) => step.name === "doctor process settlement");
   const databaseRollback = result.steps.findLast((step) => step.name === "database rollback");
-  // Current-core maintenance owns its Doctor park even after a normal child exit,
-  // which needs no cancellation settlement receipt. Only an exited post-plugin Doctor
-  // reports failure facts here, after its process custody settles; data-at-risk
-  // refusals are thrown instead and still refuse recovery.
-  const plugins = result.postUpdate?.plugins;
+  // Current-core maintenance has no package rollback, but still owns its Doctor park.
   const currentCore =
     params.coreAlreadyCurrent === true &&
     !params.packageTransaction &&
     result.status === "error" &&
-    (settlement !== undefined ||
-      (plugins?.status === "error" &&
-        plugins.reason === POST_PLUGIN_DOCTOR_EXECUTION_FAILED_REASON &&
-        (plugins.failureFacts?.length ?? 0) > 0));
+    settlement !== undefined;
   if (
     (!currentCore && result.reason !== "state-migrated-no-rollback") ||
     (params.coreAlreadyCurrent && result.recovery?.serviceRestartSafe === false) ||
@@ -237,8 +241,7 @@ export async function admitInstalledGatewayRecovery(
     !params.shouldRestart ||
     !params.preManagedServiceStop?.stopped ||
     databaseRollback?.exitCode === 0 ||
-    // Normal current-core Doctor completion needs no settlement receipt.
-    (!currentCore && !settlement && !databaseRollback) ||
+    (!settlement && !databaseRollback) ||
     (result.recovery?.serviceRestartSafe === false &&
       result.recovery.reason === "source-rollback-failed")
   ) {
@@ -375,6 +378,7 @@ export async function maybeRestartServiceAfterFailedMutableUpdate(params: {
         "Service recovery lost its original update executor.",
       );
     }
+    params.updateRun?.deadline?.signal.throwIfAborted();
     executor?.assertCurrent();
   };
   const before = params.preManagedServiceStop;
@@ -500,14 +504,18 @@ export async function maybeRestartServiceAfterFailedMutableUpdate(params: {
       );
     }
     assertCurrent();
-    const health = await waitForGatewayHealthyRestart({
-      service,
-      port,
-      env: current.env,
+    const { health } = await observeUpdateGatewayReadiness({
+      serviceEnv: current.env,
+      gatewayPort: port,
       timeoutMs: params.timeoutMs,
+      deadline: run?.deadline,
       expectedVersion: original?.version ?? packageRecovery?.version,
       expectedBuildId: original?.buildId ?? packageRecovery?.buildId,
       requireRunningService: true,
+      healthOnly: true,
+      assertCurrent,
+      onProgress: (stage, reason) =>
+        defaultRuntime[params.jsonMode ? "error" : "log"](`Gateway recovery (${stage}): ${reason}`),
       settle: { probes: 12 },
     });
     assertCurrent();
@@ -600,14 +608,9 @@ export async function compensateOriginalManagedService(
       invocationCwd: params.invocationCwd,
     })) === "healthy";
   assertCurrent();
-  const summary = [
-    healthy
-      ? `Original managed service ${original.version} is healthy. Requested package activation was not verified; package and state were retained.`
-      : "Original managed service compensation was not verified; package and current state were retained.",
-    original.packageFingerprintWarning,
-  ]
-    .filter(Boolean)
-    .join("\n");
+  const summary = healthy
+    ? `Original managed service ${original.version} is healthy. Requested package activation was not verified; package and state were retained.`
+    : "Original managed service compensation was not verified; package and current state were retained.";
   return {
     result: {
       ...result,

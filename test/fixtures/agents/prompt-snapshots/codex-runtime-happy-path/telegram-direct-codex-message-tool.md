@@ -69,6 +69,7 @@
     },
     "features.code_mode_only": false,
     "features.goals": false,
+    "features.reasoning_effort_override": true,
     "features.shell_tool": true,
     "features.standalone_web_search": false,
     "project_doc_max_bytes": 131072,
@@ -116,6 +117,7 @@
     "features.code_mode": true,
     "features.code_mode_only": false,
     "features.goals": false,
+    "features.reasoning_effort_override": true,
     "features.shell_tool": true,
     "features.standalone_web_search": false,
     "project_doc_max_bytes": 131072,
@@ -152,7 +154,7 @@
     },
     "openclaw_source_delivery": {
       "kind": "application",
-      "value": "Current source-delivery policy for this turn (replaces earlier source-delivery guidance):\nVisible source replies are not automatically delivered for this run. Use `message(action=send)` for user-visible source-channel output. For progress, set `final=false`. Set `final=true`, or omit it, for the completed reply to the current source conversation; OpenClaw stops after confirming delivery. Do not repeat visible message content in your final answer.\n\n`send`: `message`; current source is default target. Set `target` only elsewhere.\n\nCommentary is optional progress and may be hidden. Answer user questions or status requests received during ongoing work with `message(action=send, final=false)`, then continue the task. Before finishing, deliver every still-pending answer through this turn's visible-reply route. Do not repeat answers already delivered."
+      "value": "Current source-delivery policy for this turn (replaces earlier source-delivery guidance):\nVisible source replies are not automatically delivered for this run. Use `message(action=send)` for source output. For progress, set `final=false`. Set `final=true`, or omit it, for a completed reply to the current source. An added reaction to the current source message with `final=true` can also complete the reply. Do not repeat delivered content.\n\n`send`: `message`; current source is default target. Set `target` only elsewhere.\n\nCommentary is optional progress and may be hidden. Answer user questions or status requests received during ongoing work with `message(action=send, final=false)`, then continue the task. Before finishing, deliver every still-pending answer through this turn's visible-reply route. Do not repeat answers already delivered."
     },
     "openclaw_temporal_context": {
       "kind": "application",
@@ -236,8 +238,8 @@ This is the deterministic model-bound layer stack OpenClaw can snapshot for the 
 ```json
 {
   "additionalContext": {
-    "chars": 1348,
-    "roughTokens": 337
+    "chars": 1338,
+    "roughTokens": 335
   },
   "codexCollaborationModeDeveloperInstructions": {
     "chars": 0,
@@ -256,8 +258,8 @@ This is the deterministic model-bound layer stack OpenClaw can snapshot for the 
     "roughTokens": 0
   },
   "dynamicToolsJson": {
-    "chars": 72943,
-    "roughTokens": 18236
+    "chars": 73008,
+    "roughTokens": 18252
   },
   "openClawDeveloperInstructions": {
     "chars": 3194,
@@ -268,12 +270,12 @@ This is the deterministic model-bound layer stack OpenClaw can snapshot for the 
     "roughTokens": 127
   },
   "totalTextOnly": {
-    "chars": 27580,
-    "roughTokens": 6895
+    "chars": 27570,
+    "roughTokens": 6893
   },
   "totalWithDynamicToolsJson": {
-    "chars": 100525,
-    "roughTokens": 25132
+    "chars": 100580,
+    "roughTokens": 25145
   },
   "userInputText": {
     "chars": 879,
@@ -535,7 +537,7 @@ This turn asks Codex app-server to resolve its built-in Default collaboration-mo
 
 ```text
 <openclaw_source_delivery>Current source-delivery policy for this turn (replaces earlier source-delivery guidance):
-Visible source replies are not automatically delivered for this run. Use `message(action=send)` for user-visible source-channel output. For progress, set `final=false`. Set `final=true`, or omit it, for the completed reply to the current source conversation; OpenClaw stops after confirming delivery. Do not repeat visible message content in your final answer.
+Visible source replies are not automatically delivered for this run. Use `message(action=send)` for source output. For progress, set `final=false`. Set `final=true`, or omit it, for a completed reply to the current source. An added reaction to the current source message with `final=true` can also complete the reply. Do not repeat delivered content.
 
 `send`: `message`; current source is default target. Set `target` only elsewhere.
 
@@ -680,7 +682,7 @@ Full JSON: `codex-dynamic-tools.telegram-direct.json`
           "type": "string"
         },
         "final": {
-          "description": "For source replies, set false for progress; set true, or omit, for a completed send. For react, set true only when the user explicitly requested the reaction to the current source message as the complete response; omit or set false for acknowledgements or reactions followed by more work.",
+          "description": "For source replies, set false for progress; set true, or omit, for a completed send. For react, set true when adding a reaction to the current source message is your complete response; omit or set false when more work follows. A confirmed final source reply ends the turn.",
           "type": "boolean"
         },
         "forceDocument": {

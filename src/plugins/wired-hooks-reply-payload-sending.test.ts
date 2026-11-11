@@ -1,11 +1,13 @@
+/** Tests reply payload sending through wired plugin hook flows. */
 import { describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import {
   getReplyPayloadMetadata,
   setReplyPayloadMetadata,
   type ReplyPayload,
 } from "../auto-reply/reply-payload.js";
 import type { PluginHookReplyPayload } from "./hook-types.js";
-import { createHookRunnerWithRegistry } from "./hooks.test-helpers.js";
+import { createHookRunnerWithRegistry } from "./hooks.test-fixtures.js";
 
 const replyPayloadSendingEvent = {
   payload: { text: "hello" } satisfies ReplyPayload,
@@ -23,11 +25,47 @@ const replyPayloadSendingCtx = {
   runId: "run-123",
 };
 
-function firstErrorLog(logger: { error: ReturnType<typeof vi.fn> }) {
-  return logger.error.mock.calls[0];
-}
-
 describe("reply_payload_sending hook runner", () => {
+  it("fails open after the default per-handler timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const logger = { warn: vi.fn(), error: vi.fn() };
+      const firstStarted = createDeferred();
+      const first = vi.fn(() => {
+        firstStarted.resolve();
+        return new Promise<never>(() => {});
+      });
+      const second = vi.fn().mockResolvedValue({ payload: { text: "after timeout" } });
+      const { runner } = createHookRunnerWithRegistry(
+        [
+          { hookName: "reply_payload_sending", handler: first },
+          { hookName: "reply_payload_sending", handler: second },
+        ],
+        { logger },
+      );
+
+      const resultPromise = runner.runReplyPayloadSending(
+        replyPayloadSendingEvent,
+        replyPayloadSendingCtx,
+      );
+      await firstStarted.promise;
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      await expect(resultPromise).resolves.toEqual({
+        payload: { text: "after timeout" },
+        cancel: undefined,
+        reason: undefined,
+      });
+      expect(second).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledWith(
+        "[hooks] reply_payload_sending handler from test-plugin failed: timed out after 15000ms",
+      );
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("passes the latest payload between handlers", async () => {
     const first = vi.fn().mockResolvedValue({
       payload: {
@@ -98,35 +136,6 @@ describe("reply_payload_sending hook runner", () => {
       reason: "blocked",
     });
     expect(second).not.toHaveBeenCalled();
-  });
-
-  it("continues after handler errors", async () => {
-    const logger = {
-      warn: vi.fn(),
-      error: vi.fn(),
-    };
-    const failing = vi.fn().mockRejectedValue(new Error("boom"));
-    const succeeding = vi
-      .fn()
-      .mockResolvedValue({ payload: { text: "ok" } satisfies ReplyPayload });
-    const { runner } = createHookRunnerWithRegistry(
-      [
-        { hookName: "reply_payload_sending", handler: failing },
-        { hookName: "reply_payload_sending", handler: succeeding },
-      ],
-      { logger },
-    );
-
-    const result = await runner.runReplyPayloadSending(
-      replyPayloadSendingEvent,
-      replyPayloadSendingCtx,
-    );
-
-    expect(result).toEqual({ payload: { text: "ok" }, cancel: undefined, reason: undefined });
-    expect(logger.error).toHaveBeenCalledTimes(1);
-    expect(firstErrorLog(logger)).toEqual([
-      "[hooks] reply_payload_sending handler from test-plugin failed: boom",
-    ]);
   });
 
   it("does not expose trusted local media to plugins", async () => {

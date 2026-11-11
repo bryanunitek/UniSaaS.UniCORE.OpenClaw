@@ -15,7 +15,7 @@ import { DEFAULT_ELEVENLABS_BASE_URL, normalizeElevenLabsBaseUrl } from "./share
 
 const DEFAULT_ELEVENLABS_STT_MODEL = "scribe_v2";
 
-export async function transcribeElevenLabsAudio(
+async function transcribeElevenLabsAudio(
   req: AudioTranscriptionRequest,
 ): Promise<AudioTranscriptionResult> {
   const fetchFn = req.fetchFn ?? fetch;
@@ -49,11 +49,18 @@ export async function transcribeElevenLabsAudio(
       prompt: req.prompt,
     },
   });
+  for (const key of ["no_verbatim", "tag_audio_events", "diarize"]) {
+    const value = req.query?.[key];
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      form.set(key, String(value));
+    }
+  }
   const { response, release } = await postTranscriptionRequest({
     url: `${baseUrl}/v1/speech-to-text`,
     headers,
     body: form,
     timeoutMs: req.timeoutMs,
+    ...(req.signal ? { signal: req.signal } : {}),
     fetchFn,
     allowPrivateNetwork,
     dispatcherPolicy,
@@ -67,7 +74,7 @@ export async function transcribeElevenLabsAudio(
       "ElevenLabs audio transcription failed",
     );
     const text = requireTranscriptionText(
-      typeof payload.text === "string" ? payload.text : undefined,
+      payload.text,
       "ElevenLabs audio transcription response missing text",
     );
     return { text, model };

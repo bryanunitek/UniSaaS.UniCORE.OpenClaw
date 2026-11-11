@@ -19,15 +19,20 @@ export function shouldDebounceTextInbound(params: {
     return false;
   }
   if (params.hasMedia) {
+    // Media payloads carry per-message attachments; merging them into a debounced text batch can
+    // detach the attachment metadata from the original inbound event.
     return false;
   }
   const text = normalizeOptionalString(params.text) ?? "";
   if (!text) {
     return false;
   }
+  // Control commands must dispatch immediately so stop/abort/status requests are not delayed
+  // behind normal conversation text.
   return !isControlCommandMessage(text, params.cfg, params.commandOptions);
 }
 
+/** Snapshot timing by default; resolveDebounceMs opts into per-entry timing. */
 export function createChannelInboundDebouncer<T>(
   params: Omit<InboundDebounceCreateParams<T>, "debounceMs"> & {
     cfg: OpenClawConfig;
@@ -44,6 +49,8 @@ export function createChannelInboundDebouncer<T>(
     overrideMs: params.debounceMsOverride,
   });
   const { cfg: _cfg, channel: _channel, debounceMsOverride: _override, ...rest } = params;
+  // The lower-level debouncer only needs queue callbacks and timing. Strip config-only inputs so
+  // future helper options do not accidentally leak into its runtime shape.
   const debouncer = createInboundDebouncer<T>({
     debounceMs,
     ...rest,

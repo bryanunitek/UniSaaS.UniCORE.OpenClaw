@@ -1,5 +1,8 @@
 import { MAX_TIMER_TIMEOUT_MS, resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
 
+// Timer delay normalization helpers for voice-call lifecycle timers.
+
+/** Convert seconds to a safe timeout delay in milliseconds. */
 export function resolveVoiceCallSecondsTimerDelayMs(seconds: number, minMs = 1): number {
   if (!Number.isFinite(seconds)) {
     return resolveTimerTimeoutMs(MAX_TIMER_TIMEOUT_MS, MAX_TIMER_TIMEOUT_MS, minMs);
@@ -10,8 +13,4 @@ export function resolveVoiceCallSecondsTimerDelayMs(seconds: number, minMs = 1):
     minMs,
     minMs,
   );
-}
-
-export function resolveVoiceCallTimerDelayMs(timeoutMs: number, fallbackMs = 1): number {
-  return resolveTimerTimeoutMs(timeoutMs, fallbackMs);
 }

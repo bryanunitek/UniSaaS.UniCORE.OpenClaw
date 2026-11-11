@@ -1,52 +1,152 @@
+/**
+ * MCP HTTP fetch wrappers.
+ * Adds SSRF protection, scoped TLS/client-cert dispatchers, response cleanup,
+ * and same-origin header handling around the MCP SDK fetch contract.
+ */
 import fs from "node:fs";
 import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { fetchWithSsrFGuard } from "../infra/net/fetch-guard.js";
+import { wrapGuardedBodyStream } from "../infra/net/guarded-body-stream.js";
+import {
+  ssrfPolicyFromHttpBaseUrlAllowedOrigin,
+  type PinnedDispatcherPolicy,
+} from "../infra/net/ssrf.js";
+import { globalUndiciStreamTimeoutMs } from "../infra/net/undici-dispatcher-options.js";
 import { loadUndiciRuntimeDeps } from "../infra/net/undici-runtime.js";
+import type { ResolvedHttpMcpTransportConfig } from "./mcp-transport-config.js";
 
-export type { FetchLike };
-
-export const fetchWithUndici: FetchLike = async (url, init) =>
+const fetchWithUndiciGuard = async (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> =>
   (await loadUndiciRuntimeDeps().fetch(
-    url,
+    input instanceof Request ? input.url : input,
     init as Parameters<ReturnType<typeof loadUndiciRuntimeDeps>["fetch"]>[1],
   )) as unknown as Response;
 
-export function buildMcpHttpFetch(params: {
+const MCP_HTTP_MAX_REDIRECTS = 20;
+
+type McpHttpFetchParams = {
   sslVerify?: boolean;
   clientCert?: string;
   clientKey?: string;
   resourceUrl?: string;
-}): FetchLike {
-  const needsCustomDispatcher =
-    params.sslVerify === false || Boolean(params.clientCert || params.clientKey);
-  if (!needsCustomDispatcher) {
-    return fetchWithUndici;
+  timeoutMs?: number;
+  requestTimeoutMs?: number;
+  beforeRequest?: () => void;
+};
+
+type McpOAuthHttpFetchParams = McpHttpFetchParams & {
+  resourceUrl: string;
+  headers?: Record<string, string>;
+};
+
+function resolveFetchRequest(input: RequestInfo | URL, init?: RequestInit) {
+  if (input instanceof Request) {
+    const request = new Request(input, init);
+    const body = request.body ?? undefined;
+    return {
+      url: request.url,
+      signal: request.signal,
+      init: {
+        method: request.method,
+        headers: request.headers,
+        body,
+        redirect: request.redirect,
+        ...(body ? ({ duplex: "half" } as const) : {}),
+      } satisfies RequestInit & { duplex?: "half" },
+    };
   }
-  const scopedOrigin = params.resourceUrl ? new URL(params.resourceUrl).origin : undefined;
-
-  const buildDispatcher = () => {
-    const { Agent } = loadUndiciRuntimeDeps();
-    return new Agent({
-      connect: {
-        ...(params.sslVerify === false ? { rejectUnauthorized: false } : {}),
-        ...(params.clientCert ? { cert: fs.readFileSync(params.clientCert, "utf-8") } : {}),
-        ...(params.clientKey ? { key: fs.readFileSync(params.clientKey, "utf-8") } : {}),
-      },
-    });
-  };
-
-  let dispatcher: unknown;
-  return async (url, init) => {
-    if (scopedOrigin && new URL(url).origin !== scopedOrigin) {
-      return fetchWithUndici(url, init);
-    }
-    dispatcher ??= buildDispatcher();
-    return (await loadUndiciRuntimeDeps().fetch(url, {
-      ...(init as RequestInit),
-      dispatcher,
-    } as Parameters<ReturnType<typeof loadUndiciRuntimeDeps>["fetch"]>[1])) as unknown as Response;
+  const { signal, ...requestInit } = init ?? {};
+  return {
+    url: input instanceof URL ? input.toString() : input,
+    signal: signal ?? undefined,
+    init: init ? requestInit : undefined,
   };
 }
 
+function buildMcpHttpFetchWithRedirectPolicy(
+  params: McpHttpFetchParams,
+  redirectPolicy: "replay" | "reject",
+): FetchLike {
+  const needsCustomDispatcher =
+    params.sslVerify === false || Boolean(params.clientCert || params.clientKey);
+  const scopedOrigin = params.resourceUrl ? new URL(params.resourceUrl).origin : undefined;
+  const policy = params.resourceUrl
+    ? ssrfPolicyFromHttpBaseUrlAllowedOrigin(params.resourceUrl)
+    : undefined;
+
+  let customConnect: Record<string, unknown> | undefined;
+  const resolveCustomDispatcherPolicy = (url: URL): PinnedDispatcherPolicy | undefined => {
+    if (!needsCustomDispatcher || !scopedOrigin || url.origin !== scopedOrigin) {
+      return undefined;
+    }
+    customConnect ??= {
+      ...(params.sslVerify === false ? { rejectUnauthorized: false } : {}),
+      ...(params.clientCert ? { cert: fs.readFileSync(params.clientCert, "utf-8") } : {}),
+      ...(params.clientKey ? { key: fs.readFileSync(params.clientKey, "utf-8") } : {}),
+    };
+    return { mode: "direct", connect: customConnect };
+  };
+
+  return async (url, init) => {
+    const request = resolveFetchRequest(url, init);
+    const guardedFetchOptions = {
+      url: request.url,
+      init: request.init,
+      fetchImpl: fetchWithUndiciGuard,
+      maxRedirects: MCP_HTTP_MAX_REDIRECTS,
+      ...(redirectPolicy === "reject"
+        ? { rejectCrossOriginUnsafeRedirectReplay: true }
+        : { allowCrossOriginUnsafeRedirectReplay: true }),
+      auditContext: "mcp-http",
+      useEnvProxyForEligibleUrls: true,
+      beforeRequest: params.beforeRequest,
+      // Keep Undici's existing stream default unless the MCP request needs longer.
+      streamTimeoutMs:
+        params.requestTimeoutMs === undefined
+          ? undefined
+          : Math.max(params.requestTimeoutMs, globalUndiciStreamTimeoutMs ?? 300_000),
+      ...(request.signal ? { signal: request.signal } : {}),
+      ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
+      ...(policy ? { policy } : {}),
+      ...(needsCustomDispatcher ? { resolveDispatcherPolicy: resolveCustomDispatcherPolicy } : {}),
+    };
+    const { response, release, refreshTimeout } = await fetchWithSsrFGuard(guardedFetchOptions);
+    if (!response.body) {
+      void release();
+    }
+    // A body-less foreign Response exposes no bounded reader. Never materialize it
+    // with text() or arrayBuffer() before the transport's response cap can apply.
+    return new Response(
+      response.body
+        ? wrapGuardedBodyStream({ body: response.body, cleanup: release, refreshTimeout })
+        : null,
+      {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      },
+    );
+  };
+}
+
+/** Builds an MCP resource fetch with optional TLS/client-cert dispatcher support. */
+export function buildMcpHttpFetch(params: McpHttpFetchParams): FetchLike {
+  return buildMcpHttpFetchWithRedirectPolicy(params, "replay");
+}
+
+/** Builds an OAuth fetch with scoped resource headers and fail-closed redirect replay. */
+export function buildMcpOAuthHttpFetch(params: McpOAuthHttpFetchParams): FetchLike {
+  const { headers, ...fetchParams } = params;
+  return withSameOriginMcpHttpHeaders({
+    fetchFn: buildMcpHttpFetchWithRedirectPolicy(fetchParams, "reject"),
+    headers: withoutMcpAuthorizationHeader(headers),
+    resourceUrl: params.resourceUrl,
+  });
+}
+
+/** Removes Authorization from MCP headers before forwarding to non-authorized paths. */
 export function withoutMcpAuthorizationHeader(
   headers: Record<string, string> | undefined,
 ): Record<string, string> | undefined {
@@ -57,6 +157,7 @@ export function withoutMcpAuthorizationHeader(
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
+/** Wraps MCP fetch so configured headers are applied only to the resource origin. */
 export function withSameOriginMcpHttpHeaders(params: {
   fetchFn: FetchLike;
   headers: Record<string, string> | undefined;
@@ -76,4 +177,20 @@ export function withSameOriginMcpHttpHeaders(params: {
     }
     return params.fetchFn(url, { ...(init as RequestInit), headers });
   };
+}
+
+/** OAuth discovery and token responses are short-lived, so the deadline covers their bodies. */
+export function buildMcpOAuthAuthorizationFetch(
+  config: ResolvedHttpMcpTransportConfig,
+  beforeRequest?: () => void,
+): FetchLike {
+  return buildMcpOAuthHttpFetch({
+    sslVerify: config.sslVerify,
+    clientCert: config.clientCert,
+    clientKey: config.clientKey,
+    resourceUrl: config.url,
+    timeoutMs: config.requestTimeoutMs,
+    beforeRequest,
+    headers: config.headers,
+  });
 }

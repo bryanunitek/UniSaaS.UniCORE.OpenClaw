@@ -10,7 +10,7 @@ import {
   validateAnthropicSetupToken,
 } from "openclaw/plugin-sdk/provider-auth";
 import { normalizeStringEntries, uniqueStrings } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { resolveQaAgentAuthDir, writeQaAuthProfiles } from "../shared/auth-store.js";
+import { writeQaAuthProfiles } from "../shared/auth-store.js";
 
 export const QA_LIVE_ANTHROPIC_SETUP_TOKEN_ENV = "OPENCLAW_QA_LIVE_ANTHROPIC_SETUP_TOKEN";
 export const QA_LIVE_SETUP_TOKEN_VALUE_ENV = "OPENCLAW_LIVE_SETUP_TOKEN_VALUE";
@@ -41,36 +41,15 @@ function isQaLiveOfficialOpenAiBaseUrl(baseUrl: unknown): boolean {
   if (typeof baseUrl !== "string" || !baseUrl.trim()) {
     return true;
   }
-  try {
-    const url = new URL(baseUrl.trim());
-    return (
-      url.protocol === "https:" &&
-      url.hostname.toLowerCase() === "api.openai.com" &&
-      (url.pathname === "" ||
-        url.pathname === "/" ||
-        url.pathname === "/v1" ||
-        url.pathname === "/v1/")
-    );
-  } catch {
-    return false;
-  }
-}
-
-function qaLiveOpenAiUsesCodexByDefault(cfg: OpenClawConfig): boolean {
-  return isQaLiveOfficialOpenAiBaseUrl(
-    resolveQaLiveProviderConfig({ cfg, providerId: "openai" })?.baseUrl,
+  const url = URL.parse(baseUrl.trim());
+  return (
+    url?.protocol === "https:" &&
+    url.hostname.toLowerCase() === "api.openai.com" &&
+    (url.pathname === "" ||
+      url.pathname === "/" ||
+      url.pathname === "/v1" ||
+      url.pathname === "/v1/")
   );
-}
-
-function expandQaLiveApiKeyProviderIds(params: {
-  cfg: OpenClawConfig;
-  providerIds: readonly string[];
-}) {
-  const expanded = new Set(normalizeQaLiveProviderIds(params.providerIds));
-  if (expanded.has(QA_OPENAI_PROVIDER_ID) && qaLiveOpenAiUsesCodexByDefault(params.cfg)) {
-    expanded.add(QA_OPENAI_PROVIDER_ID);
-  }
-  return [...expanded].toSorted();
 }
 
 function resolveQaLiveEnvApiKey(params: {
@@ -125,14 +104,6 @@ function resolveQaLiveConfiguredApiKey(params: {
   return { apiKey: normalized, source: "models.json" };
 }
 
-function resolveQaLiveApiKey(params: {
-  providerId: string;
-  env: NodeJS.ProcessEnv;
-  cfg: OpenClawConfig;
-}) {
-  return resolveQaLiveEnvApiKey(params) ?? resolveQaLiveConfiguredApiKey(params);
-}
-
 function resolveQaLiveProviderConfig(params: { cfg: OpenClawConfig; providerId: string }) {
   const providers = params.cfg.models?.providers;
   if (!providers) {
@@ -142,10 +113,6 @@ function resolveQaLiveProviderConfig(params: { cfg: OpenClawConfig; providerId: 
     providers[params.providerId] ??
     Object.entries(providers).find(([providerId]) => providerId.trim() === params.providerId)?.[1]
   );
-}
-
-function hasQaLiveStagedApiKeyProfile(params: { cfg: OpenClawConfig; providerId: string }) {
-  return Boolean(params.cfg.auth?.profiles?.[buildQaLiveApiKeyProfileId(params.providerId)]);
 }
 
 function qaLiveRequiresCodexAuth(params: {
@@ -164,7 +131,9 @@ function qaLiveRequiresCodexAuth(params: {
   if (forcedRuntime === "codex") {
     return true;
   }
-  return qaLiveOpenAiUsesCodexByDefault(params.cfg);
+  return isQaLiveOfficialOpenAiBaseUrl(
+    resolveQaLiveProviderConfig({ cfg: params.cfg, providerId: "openai" })?.baseUrl,
+  );
 }
 
 function resolveQaLiveAnthropicSetupToken(env: NodeJS.ProcessEnv = process.env) {
@@ -196,7 +165,7 @@ export async function stageQaLiveAnthropicSetupToken(params: {
     return params.cfg;
   }
   await writeQaAuthProfiles({
-    agentDir: resolveQaAgentAuthDir({ stateDir: params.stateDir, agentId: "main" }),
+    agentId: "main",
     profiles: {
       [resolved.profileId]: {
         type: "token",
@@ -204,6 +173,7 @@ export async function stageQaLiveAnthropicSetupToken(params: {
         token: resolved.token,
       },
     },
+    stateDir: params.stateDir,
   });
   return applyAuthProfileConfig(params.cfg, {
     profileId: resolved.profileId,
@@ -221,7 +191,7 @@ export async function stageQaLiveApiKeyProfiles(params: {
   agentIds?: readonly string[];
 }): Promise<OpenClawConfig> {
   const env = params.env ?? process.env;
-  const providerIds = uniqueStrings(normalizeStringEntries(params.providerIds)).toSorted();
+  const providerIds = normalizeQaLiveProviderIds(params.providerIds);
   const profiles: Record<
     string,
     {
@@ -232,8 +202,10 @@ export async function stageQaLiveApiKeyProfiles(params: {
     }
   > = {};
   let next = params.cfg;
-  for (const providerId of expandQaLiveApiKeyProviderIds({ cfg: next, providerIds })) {
-    const resolved = resolveQaLiveApiKey({ providerId, env, cfg: next });
+  for (const providerId of providerIds) {
+    const credentials = { providerId, env, cfg: next };
+    const resolved =
+      resolveQaLiveEnvApiKey(credentials) ?? resolveQaLiveConfiguredApiKey(credentials);
     if (!resolved?.apiKey) {
       continue;
     }
@@ -256,14 +228,15 @@ export async function stageQaLiveApiKeyProfiles(params: {
     return next;
   }
   const agentIds = uniqueStrings(params.agentIds ?? QA_LIVE_API_KEY_AGENT_IDS);
-  await Promise.all(
-    agentIds.map((agentId) =>
-      writeQaAuthProfiles({
-        agentDir: resolveQaAgentAuthDir({ stateDir: params.stateDir, agentId }),
-        profiles,
-      }),
-    ),
-  );
+  // Each agent store shares the isolated state database. Stage them serially so
+  // one fixture write cannot revoke another write's SQLite admission.
+  for (const agentId of agentIds) {
+    await writeQaAuthProfiles({
+      agentId,
+      profiles,
+      stateDir: params.stateDir,
+    });
+  }
   return next;
 }
 
@@ -279,7 +252,7 @@ export function assertQaLiveCodexAuthAvailable(params: {
   }
   if (
     resolveQaLiveEnvApiKey({ providerId: QA_OPENAI_PROVIDER_ID, env, cfg: params.cfg })?.apiKey ||
-    hasQaLiveStagedApiKeyProfile({ cfg: params.cfg, providerId: QA_OPENAI_PROVIDER_ID })
+    params.cfg.auth?.profiles?.[buildQaLiveApiKeyProfileId(QA_OPENAI_PROVIDER_ID)]
   ) {
     return;
   }

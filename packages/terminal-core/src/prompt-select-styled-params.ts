@@ -1,30 +1,21 @@
 import { stylePromptHint, stylePromptMessage } from "./prompt-style.js";
 
+// Pure prompt parameter styler used by interactive prompts and tests.
+
+/** Minimal select-like params accepted by the prompt styler. */
 type SelectParamsLike = {
   message: string;
   options: readonly object[];
 };
 
-type PromptSelectStylers = {
-  message: (value: string) => string;
-  hint: (value: string) => string | undefined;
-};
-
-const defaultStylers: PromptSelectStylers = {
-  message: stylePromptMessage,
-  hint: stylePromptHint,
-};
-
-export function styleSelectParams<TParams extends SelectParamsLike>(
-  params: TParams,
-  stylers: PromptSelectStylers = defaultStylers,
-): TParams {
+/** Return select params with styled prompt message and per-option hints. */
+export function styleSelectParams<TParams extends SelectParamsLike>(params: TParams): TParams {
   return {
     ...params,
-    message: stylers.message(params.message),
+    message: stylePromptMessage(params.message),
     options: params.options.map((opt) => {
       const hint = "hint" in opt && typeof opt.hint === "string" ? opt.hint : undefined;
-      return hint === undefined ? opt : { ...opt, hint: stylers.hint(hint) };
+      return hint === undefined ? opt : { ...opt, hint: stylePromptHint(hint) };
     }),
   } as TParams;
 }

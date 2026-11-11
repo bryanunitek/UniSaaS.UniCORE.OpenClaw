@@ -1,9 +1,7 @@
-import { isNodeRoleMethod } from "./method-scopes.js";
-
-const GATEWAY_ROLES = ["operator", "node"] as const;
-
-/** Gateway connection roles used before method-level operator scope checks. */
-export type GatewayRole = (typeof GATEWAY_ROLES)[number];
+// Gateway connection role policy.
+// Separates node-role RPCs from operator RPCs before method scope checks.
+import { isCoreNodeGatewayMethod } from "./methods/core-method-policy.js";
+import type { GatewayRole } from "./role-policy.types.js";
 
 /** Parses the untrusted role claim from connect params into the closed role set. */
 export function parseGatewayRole(roleRaw: unknown): GatewayRole | null {
@@ -20,7 +18,7 @@ export function roleCanSkipDeviceIdentity(role: GatewayRole, sharedAuthOk: boole
 
 /** Keeps node-originated notifications off the operator RPC surface, and vice versa. */
 export function isRoleAuthorizedForMethod(role: GatewayRole, method: string): boolean {
-  if (isNodeRoleMethod(method)) {
+  if (isCoreNodeGatewayMethod(method)) {
     return role === "node";
   }
   return role === "operator";

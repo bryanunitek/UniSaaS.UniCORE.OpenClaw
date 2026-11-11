@@ -1,4 +1,5 @@
-import { normalizeLowercaseStringOrEmpty } from "./provider-id.js";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { parseModelCatalogRef } from "./model-catalog-refs.js";
 import {
   normalizeGooglePreviewModelId,
   normalizeTogetherModelId,
@@ -36,24 +37,14 @@ export function collectManifestModelIdNormalizationPolicies(
   return policies;
 }
 
-export function setCurrentManifestModelIdNormalizationRecords(
-  plugins: readonly ManifestModelIdNormalizationRecord[] | undefined,
+/** Replace the process-local manifest normalization policy snapshot. */
+export function setCurrentManifestModelIdNormalizationPolicies(
+  policies: ReadonlyMap<string, ManifestModelIdNormalizationProvider> | undefined,
 ): void {
-  currentManifestModelIdNormalizationPolicies = plugins
-    ? collectManifestModelIdNormalizationPolicies(plugins)
-    : undefined;
+  currentManifestModelIdNormalizationPolicies = policies;
 }
 
-export function getCurrentManifestModelIdNormalizationPolicies():
-  | ReadonlyMap<string, ManifestModelIdNormalizationProvider>
-  | undefined {
-  return currentManifestModelIdNormalizationPolicies;
-}
-
-function hasProviderPrefix(modelId: string): boolean {
-  return modelId.includes("/");
-}
-
+/** Join a provider prefix and model id with exactly one slash. */
 function formatPrefixedModelId(prefix: string, modelId: string): string {
   return `${prefix.replace(/\/+$/u, "")}/${modelId.replace(/^\/+/u, "")}`;
 }
@@ -86,14 +77,14 @@ export function normalizeProviderModelIdWithPolicies(params: {
   for (const prefix of policy.stripPrefixes ?? []) {
     const normalizedPrefix = normalizeLowercaseStringOrEmpty(prefix);
     if (normalizedPrefix && normalizeLowercaseStringOrEmpty(modelId).startsWith(normalizedPrefix)) {
-      modelId = modelId.slice(prefix.length);
+      modelId = modelId.slice(normalizedPrefix.length);
       break;
     }
   }
 
   modelId = policy.aliases?.[normalizeLowercaseStringOrEmpty(modelId)] ?? modelId;
 
-  if (!hasProviderPrefix(modelId)) {
+  if (!modelId.includes("/")) {
     for (const rule of policy.prefixWhenBareAfterAliasStartsWith ?? []) {
       if (normalizeLowercaseStringOrEmpty(modelId).startsWith(rule.modelPrefix.toLowerCase())) {
         return formatPrefixedModelId(rule.prefix, modelId);
@@ -116,27 +107,42 @@ export function normalizeBuiltInProviderModelId(provider: string, model: string)
   ) {
     return normalizeGooglePreviewModelId(model);
   }
-  if (normalizedProvider === "openrouter") {
+  if (normalizedProvider === "openrouter" || normalizedProvider === "nvidia") {
     const trimmed = model.trim();
-    return trimmed && !trimmed.includes("/") ? `openrouter/${trimmed}` : model;
+    return trimmed && !trimmed.includes("/") ? `${normalizedProvider}/${trimmed}` : model;
   }
   if (normalizedProvider === "anthropic") {
+    // Mirror the Anthropic manifest aliases for callers that skip manifest normalization.
     const anthropicAliases: Record<string, string> = {
+      fable: "claude-fable-5-1",
+      "fable-5": "claude-fable-5",
+      "fable-5.1": "claude-fable-5-1",
+      "fable-5-1": "claude-fable-5-1",
+      haiku: "claude-haiku-5-5",
+      "haiku-5.5": "claude-haiku-5-5",
+      "haiku-5-5": "claude-haiku-5-5",
+      "opus-5.5": "claude-opus-5-5",
+      "opus-5-5": "claude-opus-5-5",
+      "opus-5": "claude-opus-5",
+      opus: "claude-opus-5-5",
       "opus-4.8": "claude-opus-4-8",
-      opus: "claude-opus-4-8",
+      "opus-4.7": "claude-opus-4-7",
       "opus-4.6": "claude-opus-4-6",
+      "mythos-5": "claude-mythos-5",
+      "sonnet-5.5": "claude-sonnet-5-5",
+      "sonnet-5-5": "claude-sonnet-5-5",
+      "sonnet-5": "claude-sonnet-5",
+      sonnet: "claude-sonnet-5-5",
       "sonnet-4.6": "claude-sonnet-4-6",
     };
-    const anthropicPrefix = "anthropic/";
-    const normalizedModel = normalizeLowercaseStringOrEmpty(model);
-    const providerModel = normalizedModel.startsWith(anthropicPrefix)
-      ? model.trim().slice(anthropicPrefix.length)
-      : model;
+    const providerModel = stripSelfProviderModelPrefix(normalizedProvider, model);
     return anthropicAliases[normalizeLowercaseStringOrEmpty(providerModel)] ?? providerModel;
   }
   if (normalizedProvider === "vercel-ai-gateway") {
     const vercelAliases: Record<string, string> = {
       "opus-4.6": "claude-opus-4-6",
+      "sonnet-5": "claude-sonnet-5",
+      sonnet: "claude-sonnet-4-6",
       "sonnet-4.6": "claude-sonnet-4-6",
     };
     const aliased = vercelAliases[normalizeLowercaseStringOrEmpty(model)] ?? model;
@@ -150,23 +156,15 @@ export function normalizeBuiltInProviderModelId(provider: string, model: string)
       ? model.slice(prefix.length)
       : model;
   }
-  if (normalizedProvider === "nvidia") {
-    const trimmed = model.trim();
-    return trimmed && !trimmed.includes("/") ? `nvidia/${trimmed}` : model;
-  }
   if (normalizedProvider === "xai") {
     const xaiAliases: Record<string, string> = {
+      "grok-4.3-latest": "grok-4.3",
+      "grok-4.5-latest": "grok-4.5",
+      "grok-build-latest": "grok-4.5",
       "grok-4-fast-reasoning": "grok-4-fast",
       "grok-4-1-fast-reasoning": "grok-4-1-fast",
-      "grok-4.20-experimental-beta-0304-reasoning": "grok-4.20-beta-latest-reasoning",
-      "grok-4.20-experimental-beta-0304-non-reasoning": "grok-4.20-beta-latest-non-reasoning",
-      "grok-4.20-reasoning": "grok-4.20-beta-latest-reasoning",
-      "grok-4.20-non-reasoning": "grok-4.20-beta-latest-non-reasoning",
     };
     return xaiAliases[normalizeLowercaseStringOrEmpty(model)] ?? model;
-  }
-  if (normalizedProvider === "openai") {
-    return model;
   }
   if (normalizedProvider === "together") {
     return normalizeTogetherModelId(model);
@@ -192,31 +190,27 @@ export function normalizeStaticProviderModelIdWithPolicies(
   return normalizeBuiltInProviderModelId(normalizedProvider, manifestModelId);
 }
 
+/** Normalize a configured provider/model catalog reference using current policies. */
 export function normalizeConfiguredProviderCatalogModelId(
   provider: string,
   model: string,
-  policies = getCurrentManifestModelIdNormalizationPolicies(),
+  policies = currentManifestModelIdNormalizationPolicies,
 ): string {
   const providerModel = normalizeStaticProviderModelIdWithPolicies(provider, model, policies);
   return normalizeConfiguredProviderCatalogModelRef(providerModel);
 }
 
+/** Normalize embedded Google model aliases inside provider/model catalog refs. */
 export function normalizeConfiguredProviderCatalogModelRef(providerModel: string): string {
-  const googlePrefix = "google/";
-  if (!providerModel.startsWith(googlePrefix)) {
-    const slash = providerModel.indexOf("/");
-    if (slash <= 0 || slash >= providerModel.length - 1) {
-      return providerModel;
-    }
-    const prefix = providerModel.slice(0, slash + 1);
-    const suffix = providerModel.slice(slash + 1);
-    if (!suffix.startsWith(googlePrefix)) {
-      return providerModel;
-    }
-    const normalizedSuffix = normalizeGooglePreviewModelId(suffix);
-    return normalizedSuffix === suffix ? providerModel : `${prefix}${normalizedSuffix}`;
+  if (providerModel.startsWith("google/")) {
+    return normalizeGooglePreviewModelId(providerModel);
   }
-  const modelId = providerModel.slice(googlePrefix.length);
-  const normalizedModelId = normalizeGooglePreviewModelId(modelId);
-  return normalizedModelId === modelId ? providerModel : `${googlePrefix}${normalizedModelId}`;
+  const parsed = parseModelCatalogRef(providerModel);
+  if (!parsed?.modelId.startsWith("google/")) {
+    return providerModel;
+  }
+  const normalizedModelId = normalizeGooglePreviewModelId(parsed.modelId);
+  return normalizedModelId === parsed.modelId
+    ? providerModel
+    : `${parsed.provider}/${normalizedModelId}`;
 }

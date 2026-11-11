@@ -1,4 +1,5 @@
-import { uniqueTrimmedStrings } from "./string.js";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { normalizeUniqueTrimmedStringList } from "@openclaw/normalization-core/string-normalization";
 
 export type MediaGenerationCatalogKind =
   | "image_generation"
@@ -24,6 +25,13 @@ export type MediaGenerationCatalogEntry<TCapabilities = unknown> = {
   warnings?: readonly string[];
 };
 
+/** Static catalog metadata that overrides provider defaults for one model. */
+export type MediaGenerationCatalogModelEntry<TCapabilities = unknown> = {
+  capabilities?: TCapabilities;
+  modes?: readonly string[];
+};
+
+/** Provider metadata used to synthesize static media generation catalog entries. */
 export type MediaGenerationCatalogProvider<TCapabilities = unknown> = {
   id: string;
   aliases?: readonly string[];
@@ -31,41 +39,42 @@ export type MediaGenerationCatalogProvider<TCapabilities = unknown> = {
   defaultModel?: string;
   models?: readonly string[];
   capabilities: TCapabilities;
+  catalogByModel?: Readonly<Record<string, MediaGenerationCatalogModelEntry<TCapabilities>>>;
 };
-
-function uniqueModels(provider: { defaultModel?: string; models?: readonly string[] }): string[] {
-  return uniqueTrimmedStrings([provider.defaultModel, ...(provider.models ?? [])]);
-}
 
 export function synthesizeMediaGenerationCatalogEntries<TCapabilities>(params: {
   kind: MediaGenerationCatalogKind;
   provider: MediaGenerationCatalogProvider<TCapabilities>;
   modes?: readonly string[];
 }): Array<MediaGenerationCatalogEntry<TCapabilities>> {
-  return uniqueModels(params.provider).map((model) => {
+  const defaultModel = normalizeOptionalString(params.provider.defaultModel);
+  return listMediaGenerationProviderModels(params.provider).map((model) => {
+    const modelCatalogEntry = params.provider.catalogByModel?.[model];
     const entry: MediaGenerationCatalogEntry<TCapabilities> = {
       kind: params.kind,
       provider: params.provider.id,
       model,
       source: "static",
-      capabilities: params.provider.capabilities,
+      capabilities: modelCatalogEntry?.capabilities ?? params.provider.capabilities,
     };
     if (params.provider.label) {
       entry.label = params.provider.label;
     }
-    if (model === params.provider.defaultModel) {
+    if (model === defaultModel) {
       entry.default = true;
     }
-    if (params.modes) {
-      entry.modes = params.modes;
+    const modes = modelCatalogEntry?.modes ?? params.modes;
+    if (modes) {
+      entry.modes = modes;
     }
     return entry;
   });
 }
 
+/** Return unique model ids exposed by a media generation provider. */
 export function listMediaGenerationProviderModels(provider: {
   defaultModel?: string;
   models?: readonly string[];
 }): string[] {
-  return uniqueModels(provider);
+  return normalizeUniqueTrimmedStringList([provider.defaultModel, ...(provider.models ?? [])]);
 }

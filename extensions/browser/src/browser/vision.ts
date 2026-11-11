@@ -1,46 +1,25 @@
-// Browser screenshot descriptions piggyback on the existing media image
-// understanding contract. No browser-specific model registry lives here.
+/**
+ * Browser screenshot description helpers built on the shared media image
+ * understanding contract. No browser-specific model registry lives here.
+ */
 
 import { readFile } from "node:fs/promises";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import type { describeImageFile as DescribeImageFileFn } from "openclaw/plugin-sdk/media-understanding-runtime";
-import type { saveMediaBuffer as SaveMediaBufferFn } from "../sdk-setup-tools.js";
-import type { normalizeBrowserScreenshot as NormalizeBrowserScreenshotFn } from "./screenshot.js";
+import type { RunMediaUnderstandingFileParams } from "openclaw/plugin-sdk/media-understanding-runtime";
 
-export const DEFAULT_BROWSER_SCREENSHOT_DESCRIPTION_PROMPT =
+/** Default prompt for turning browser screenshots into text-only page context. */
+const DEFAULT_BROWSER_SCREENSHOT_DESCRIPTION_PROMPT =
   "Describe what is visible in this browser screenshot. Capture page layout, headings, primary content blocks, visible text, and notable interactive elements so a text-only assistant can reason about the page.";
 
-export type BrowserScreenshotDescriptionContext = {
-  cfg: OpenClawConfig;
-  filePath: string;
-  agentDir?: string;
-  workspaceDir?: string;
-  agentId?: string;
-  activeModel?: {
-    provider?: string;
-    model?: string;
-  };
-  mediaScope?: {
-    sessionKey?: string;
-    channel?: string;
-    chatType?: string;
-  };
+/** Input context for browser screenshot image understanding. */
+type BrowserScreenshotDescriptionContext = Pick<
+  RunMediaUnderstandingFileParams,
+  "cfg" | "filePath" | "agentDir" | "workspaceDir" | "agentId"
+> & {
+  activeModel?: Partial<NonNullable<RunMediaUnderstandingFileParams["activeModel"]>>;
+  mediaScope?: RunMediaUnderstandingFileParams["scopeContext"];
   imageSanitization?: {
     maxDimensionPx?: number;
   };
-};
-
-export type BrowserScreenshotDescriptionDeps = {
-  describeImageFile: typeof DescribeImageFileFn;
-  normalizeBrowserScreenshot: typeof NormalizeBrowserScreenshotFn;
-  saveMediaBuffer: typeof SaveMediaBufferFn;
-};
-
-export type BrowserScreenshotDescriptionResult = {
-  text: string;
-  provider?: string;
-  model?: string;
-  decision?: unknown;
 };
 
 function normalizeActiveModel(
@@ -56,21 +35,22 @@ function normalizeActiveModel(
 
 async function resolveImageUnderstandingFilePath(
   ctx: BrowserScreenshotDescriptionContext,
-  deps: BrowserScreenshotDescriptionDeps,
 ): Promise<string> {
   const maxDimensionPx = ctx.imageSanitization?.maxDimensionPx;
   if (typeof maxDimensionPx !== "number" || !Number.isFinite(maxDimensionPx)) {
     return ctx.filePath;
   }
 
+  const { normalizeBrowserScreenshot } = await import("./screenshot.js");
   const source = await readFile(ctx.filePath);
-  const normalized = await deps.normalizeBrowserScreenshot(source, {
+  const normalized = await normalizeBrowserScreenshot(source, {
     maxSide: Math.max(1, Math.floor(maxDimensionPx)),
   });
   if (normalized.buffer === source) {
     return ctx.filePath;
   }
-  const saved = await deps.saveMediaBuffer(
+  const { saveMediaBuffer } = await import("openclaw/plugin-sdk/media-runtime");
+  const saved = await saveMediaBuffer(
     normalized.buffer,
     normalized.contentType ?? "image/jpeg",
     "browser",
@@ -78,15 +58,22 @@ async function resolveImageUnderstandingFilePath(
   return saved.path;
 }
 
-export async function describeBrowserScreenshot(
-  ctx: BrowserScreenshotDescriptionContext,
-  deps: BrowserScreenshotDescriptionDeps,
-): Promise<BrowserScreenshotDescriptionResult | null> {
-  const filePath = await resolveImageUnderstandingFilePath(ctx, deps);
-  const described = await deps.describeImageFile({
+/** Produces a text description for a browser screenshot, or null when no text was produced. */
+export async function describeBrowserScreenshot(ctx: BrowserScreenshotDescriptionContext) {
+  const filePath = await resolveImageUnderstandingFilePath(ctx);
+  const agentId = ctx.agentDir
+    ? undefined
+    : (await import("openclaw/plugin-sdk/agent-scope-runtime")).resolveSessionAgentIdStrict({
+        agentId: ctx.agentId,
+        sessionKey: ctx.mediaScope?.sessionKey,
+        config: ctx.cfg,
+      });
+  const { describeImageFile } = await import("openclaw/plugin-sdk/media-understanding-runtime");
+  const described = await describeImageFile({
     filePath,
     cfg: ctx.cfg,
     prompt: DEFAULT_BROWSER_SCREENSHOT_DESCRIPTION_PROMPT,
+    ...(agentId ? { agentId } : {}),
     agentDir: ctx.agentDir,
     workspaceDir: ctx.workspaceDir,
     activeModel: normalizeActiveModel(ctx.activeModel),
@@ -104,20 +91,11 @@ export async function describeBrowserScreenshot(
   };
 }
 
+/** Neutralizes model-generated MEDIA directives before feeding text back to tools. */
 export function neutralizeMediaDirectives(text: string): string {
   if (!text || !/media:/i.test(text)) {
     return text;
   }
-  const lines = text.split("\n");
-  let changed = false;
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    const leading = line.length - line.trimStart().length;
-    const rest = line.slice(leading);
-    if (/^MEDIA:/i.test(rest)) {
-      lines[i] = `${line.slice(0, leading)}[neutralized] ${rest}`;
-      changed = true;
-    }
-  }
-  return changed ? lines.join("\n") : text;
+  // Only LF separates reply lines; multiline anchors also split CR and Unicode separators.
+  return text.replace(/(^|\n)([^\S\n]*)(MEDIA:)/gi, "$1$2[neutralized] $3");
 }

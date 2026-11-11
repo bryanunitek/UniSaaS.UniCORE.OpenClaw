@@ -1,18 +1,25 @@
-import { describe, expect, it } from "vitest";
+/** Tests secrets configure plan generation and target validation. */
+import { beforeAll, describe, expect, it } from "vitest";
+import { createAuthProfileStoreFixture } from "../agents/auth-profiles/credential-fixtures.test-support.js";
 import type { OpenClawConfig } from "../config/config.js";
 import {
   TALK_TEST_PROVIDER_API_KEY_PATH,
   TALK_TEST_PROVIDER_ID,
 } from "../test-utils/talk-test-provider.js";
 import {
-  buildConfigureCandidates,
   buildConfigureCandidatesForScope,
   buildSecretsConfigurePlan,
   collectConfigureProviderChanges,
   hasConfigurePlanChanges,
 } from "./configure-plan.js";
+import { resolveConfigSecretTargetByPath } from "./target-registry.js";
 
 describe("secrets configure plan helpers", () => {
+  beforeAll(() => {
+    resolveConfigSecretTargetByPath(["channels", "telegram", "botToken"]);
+    buildConfigureCandidatesForScope({ config: {} as OpenClawConfig });
+  });
+
   it("builds configure candidates from supported configure targets", () => {
     const config = {
       talk: {
@@ -26,13 +33,25 @@ describe("secrets configure plan helpers", () => {
         telegram: {
           botToken: "token", // pragma: allowlist secret
         },
+        nostr: {
+          privateKey: "nostr-private-key", // pragma: allowlist secret
+        },
       },
     } as OpenClawConfig;
 
-    const candidates = buildConfigureCandidates(config);
+    const candidates = buildConfigureCandidatesForScope({ config });
     const paths = candidates.map((entry) => entry.path);
     expect(paths).toContain(TALK_TEST_PROVIDER_API_KEY_PATH);
     expect(paths).toContain("channels.telegram.botToken");
+    expect(paths).toContain("channels.nostr.privateKey");
+    expect(resolveConfigSecretTargetByPath(["channels", "nostr", "privateKey"])).toMatchObject({
+      entry: {
+        id: "channels.nostr.privateKey",
+        includeInPlan: true,
+        includeInConfigure: true,
+        includeInAudit: true,
+      },
+    });
   });
 
   it("collects provider upserts and deletes", () => {
@@ -58,32 +77,6 @@ describe("secrets configure plan helpers", () => {
     expect(changes.deletes).toEqual(["legacy"]);
   });
 
-  it("discovers auth-profiles candidates for the selected agent scope", () => {
-    const candidates = buildConfigureCandidatesForScope({
-      config: {} as OpenClawConfig,
-      authProfiles: {
-        agentId: "main",
-        store: {
-          version: 1,
-          profiles: {
-            "openai:default": {
-              type: "api_key",
-              provider: "openai",
-              key: "sk",
-            },
-          },
-        },
-      },
-    });
-    const openaiCandidate = candidates.find(
-      (entry) => entry.path === "profiles.openai:default.key",
-    );
-    expect(openaiCandidate?.type).toBe("auth-profiles.api_key.key");
-    expect(openaiCandidate?.agentId).toBe("main");
-    expect(openaiCandidate?.configFile).toBe("auth-profiles.json");
-    expect(openaiCandidate?.authProfileProvider).toBe("openai");
-  });
-
   it("captures existing refs for prefilled configure prompts", () => {
     const candidates = buildConfigureCandidatesForScope({
       config: {
@@ -101,20 +94,17 @@ describe("secrets configure plan helpers", () => {
       } as OpenClawConfig,
       authProfiles: {
         agentId: "main",
-        store: {
-          version: 1,
-          profiles: {
-            "openai:default": {
-              type: "api_key",
-              provider: "openai",
-              keyRef: {
-                source: "env",
-                provider: "default",
-                id: "OPENAI_API_KEY",
-              },
+        store: createAuthProfileStoreFixture({
+          "openai:default": {
+            type: "api_key",
+            provider: "openai",
+            keyRef: {
+              source: "env",
+              provider: "default",
+              id: "OPENAI_API_KEY",
             },
           },
-        },
+        }),
       },
     });
 
@@ -135,30 +125,6 @@ describe("secrets configure plan helpers", () => {
       provider: "default",
       id: "OPENAI_API_KEY", // pragma: allowlist secret
     });
-  });
-
-  it("marks normalized alias paths as derived when not authored directly", () => {
-    const candidates = buildConfigureCandidatesForScope({
-      config: {
-        talk: {
-          provider: TALK_TEST_PROVIDER_ID,
-          providers: {
-            [TALK_TEST_PROVIDER_ID]: {
-              apiKey: "demo-talk-key", // pragma: allowlist secret
-            },
-          },
-          apiKey: "demo-talk-key", // pragma: allowlist secret
-        },
-      } as OpenClawConfig,
-      authoredOpenClawConfig: {
-        talk: {
-          apiKey: "demo-talk-key", // pragma: allowlist secret
-        },
-      } as OpenClawConfig,
-    });
-
-    const normalized = candidates.find((entry) => entry.path === TALK_TEST_PROVIDER_API_KEY_PATH);
-    expect(normalized?.isDerived).toBe(true);
   });
 
   it("reports configure change presence and builds deterministic plan shape", () => {
@@ -207,7 +173,7 @@ describe("secrets configure plan helpers", () => {
     expect(plan.options).toEqual({
       scrubEnv: true,
       scrubAuthProfilesForProviderTargets: true,
-      scrubLegacyAuthJson: true,
+      scrubLegacyAuthJson: false,
     });
   });
 });

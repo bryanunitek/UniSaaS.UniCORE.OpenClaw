@@ -10,12 +10,7 @@ export function normalizeAcpProvenanceMode(
   value: string | undefined,
 ): AcpProvenanceMode | undefined {
   const normalized = normalizeOptionalLowercaseString(value);
-  if (!normalized) {
-    return undefined;
-  }
-  return (ACP_PROVENANCE_MODE_VALUES as readonly string[]).includes(normalized)
-    ? (normalized as AcpProvenanceMode)
-    : undefined;
+  return ACP_PROVENANCE_MODE_VALUES.find((mode) => mode === normalized);
 }
 
 export type AcpSession = {

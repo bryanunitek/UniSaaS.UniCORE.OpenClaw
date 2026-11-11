@@ -1,15 +1,80 @@
+// Googlechat tests cover channel config plugin behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { describe, expect, it } from "vitest";
+import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
+import { afterEach, describe, expect, it } from "vitest";
+import { inspectGoogleChatAccount } from "./accounts.js";
+import {
+  registerGoogleChatApprovalCardBinding,
+  googleChatApprovalControls,
+} from "./approval-card-actions.js";
 import { googlechatPlugin } from "./channel.js";
-import { googlechatSetupPlugin } from "./channel.setup.js";
 
 describe("googlechatPlugin config adapter", () => {
-  it("keeps setup metadata aligned with the runtime plugin", () => {
-    expect(googlechatSetupPlugin.id).toBe(googlechatPlugin.id);
-    expect(googlechatSetupPlugin.meta).toEqual(googlechatPlugin.meta);
-    expect(googlechatSetupPlugin.capabilities?.chatTypes).toEqual(
-      googlechatPlugin.capabilities?.chatTypes,
-    );
+  afterEach(() => {
+    googleChatApprovalControls.unregister(["token-1"]);
+  });
+
+  it.each([
+    {
+      serviceAccount: { source: "env", provider: "default", id: "MISSING_GOOGLE_CHAT_ACCOUNT" },
+      configured: true,
+      source: "none",
+    },
+    { serviceAccount: undefined, configured: false, source: "none" },
+  ])("inspects service account configuration as configured=$configured", async (entry) => {
+    const cfg = {
+      channels: {
+        googlechat: {
+          accounts: {
+            work: {
+              serviceAccount: entry.serviceAccount,
+              audienceType: "app-url",
+              audience: "https://bot.example.com/googlechat",
+              webhookPath: "/googlechat",
+              webhookUrl: "https://bot.example.com/googlechat",
+            },
+          },
+        },
+      },
+    } as OpenClawConfig;
+    const account = inspectGoogleChatAccount({ cfg, accountId: "work" });
+    expect(await googlechatPlugin.config.isConfigured?.(account, cfg)).toBe(entry.configured);
+    expect(account).toMatchObject({
+      accountId: "work",
+      enabled: true,
+      configured: entry.configured,
+      credentialSource: entry.source,
+      audienceType: "app-url",
+      audience: "https://bot.example.com/googlechat",
+      webhookPath: "/googlechat",
+      webhookUrl: "https://bot.example.com/googlechat",
+      dmPolicy: "pairing",
+    });
+    expect(googlechatPlugin.status?.collectStatusIssues?.([account])).toEqual([]);
+  });
+
+  it("classifies Google Chat users as direct and spaces as groups", () => {
+    const inferTargetChatType = googlechatPlugin.messaging?.inferTargetChatType;
+
+    expect(inferTargetChatType?.({ to: "users/abc" })).toBe("direct");
+    expect(inferTargetChatType?.({ to: "spaces/xyz" })).toBe("group");
+    expect(inferTargetChatType?.({ to: "unknown" })).toBeUndefined();
+  });
+
+  it("does not advertise user-auth-only actions", () => {
+    const cfg = {
+      channels: {
+        googlechat: {
+          serviceAccount: { client_email: "bot@example.com" },
+        },
+      },
+    } as OpenClawConfig;
+
+    expect(googlechatPlugin.actions?.describeMessageTool?.({ cfg })).toEqual({
+      actions: ["send"],
+    });
+    expect(googlechatPlugin.actions?.supportsAction?.({ action: "send" })).toBe(true);
+    expect(googlechatPlugin.actions?.supportsAction?.({ action: "upload-file" })).toBe(false);
   });
 
   it("keeps read-only accessors from resolving service account SecretRefs", () => {
@@ -30,9 +95,7 @@ describe("googlechatPlugin config adapter", () => {
             provider: "google_chat_service_account",
             id: "value",
           },
-          dm: {
-            allowFrom: ["users/123"],
-          },
+          allowFrom: ["users/123"],
           defaultTo: "spaces/AAA",
         },
       },
@@ -44,5 +107,51 @@ describe("googlechatPlugin config adapter", () => {
     expect(googlechatPlugin.config.resolveDefaultTo?.({ cfg, accountId: "default" })).toBe(
       "spaces/AAA",
     );
+  });
+
+  it("keeps unrelated or sendable structured approval-looking payloads visible", () => {
+    const approvalId = "12345678-1234-1234-1234-123456789012";
+    registerGoogleChatApprovalCardBinding({
+      token: "token-1",
+      accountId: "default",
+      approvalId,
+      approvalKind: "exec",
+      decision: "allow-once",
+      allowedDecisions: ["allow-once", "deny"],
+      spaceName: "spaces/AAA",
+      messageName: "spaces/AAA/messages/msg-1",
+      expiresAtMs: Date.now() + 60_000,
+    });
+    const unrelatedPayload: ReplyPayload = { text: "/approve deadbeef allow-once" };
+    const metadataPayload: ReplyPayload = {
+      text: `/approve ${approvalId.slice(0, 8)} allow-once`,
+      channelData: { execApproval: { approvalId } },
+    };
+    const structuredPayload: ReplyPayload = {
+      text: `/approve ${approvalId.slice(0, 8)} allow-once`,
+      presentation: { blocks: [] },
+    };
+
+    expect(
+      googlechatPlugin.outbound?.normalizePayload?.({
+        cfg: {} as OpenClawConfig,
+        payload: unrelatedPayload,
+      }),
+    ).toStrictEqual({ text: "/approve deadbeef allow-once" });
+    expect(
+      googlechatPlugin.outbound?.normalizePayload?.({
+        cfg: {} as OpenClawConfig,
+        payload: metadataPayload,
+      }),
+    ).toBeNull();
+    expect(
+      googlechatPlugin.outbound?.normalizePayload?.({
+        cfg: {} as OpenClawConfig,
+        payload: structuredPayload,
+      }),
+    ).toStrictEqual({
+      text: `/approve ${approvalId.slice(0, 8)} allow-once`,
+      presentation: { blocks: [] },
+    });
   });
 });

@@ -1,26 +1,38 @@
+// Msteams tests cover sso token store plugin behavior.
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  createPluginStateKeyedStoreForTests,
+  resetPluginStateStoreForTests,
+} from "openclaw/plugin-sdk/plugin-state-test-runtime";
+import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
+import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setMSTeamsRuntime } from "./runtime.js";
 import { createMSTeamsSsoTokenStoreFs } from "./sso-token-store.js";
 import { msteamsRuntimeStub } from "./test-support/runtime.js";
 
+const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
+  afterAll(async () => {
+    await closeOpenClawStateDatabaseAsync();
+    resetPluginStateStoreForTests();
+    cleanup();
+  }),
+);
+
 describe("msteams sso token store (plugin state)", () => {
+  afterEach(() => vi.unstubAllEnvs());
   beforeEach(() => {
     resetPluginStateStoreForTests();
     setMSTeamsRuntime(msteamsRuntimeStub);
   });
 
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
   it("keeps distinct tokens when connectionName and userId contain the legacy delimiter", async () => {
-    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-msteams-sso-"));
+    const stateDir = tempDirs.make("openclaw-msteams-sso-");
     const storePath = path.join(stateDir, "msteams-sso-tokens.json");
-    const store = createMSTeamsSsoTokenStoreFs({ storePath });
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    const store = createMSTeamsSsoTokenStoreFs();
 
     const first = {
       connectionName: "conn::alpha",
@@ -42,13 +54,11 @@ describe("msteams sso token store (plugin state)", () => {
     expect(await store.get(second)).toEqual(second);
 
     await expect(fs.access(storePath)).rejects.toThrow();
-    await expect(
-      fs.access(path.join(stateDir, "state", "openclaw.sqlite")),
-    ).resolves.toBeUndefined();
+    await fs.access(path.join(stateDir, "state", "openclaw.sqlite"));
   });
 
-  it("loads legacy flat-key files by rebuilding keys from stored token payloads", async () => {
-    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-msteams-sso-legacy-"));
+  it("ignores legacy flat-key token files at runtime", async () => {
+    const stateDir = tempDirs.make("openclaw-msteams-sso-legacy-");
     const storePath = path.join(stateDir, "msteams-sso-tokens.json");
     await fs.writeFile(
       storePath,
@@ -70,24 +80,55 @@ describe("msteams sso token store (plugin state)", () => {
       "utf8",
     );
 
-    const store = createMSTeamsSsoTokenStoreFs({ storePath });
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    const store = createMSTeamsSsoTokenStoreFs();
     expect(
       await store.get({
         connectionName: "conn",
         userId: "user-1",
       }),
-    ).toEqual({
-      connectionName: "conn",
-      userId: "user-1",
-      token: "token-1",
+    ).toBeNull();
+    await fs.access(storePath);
+  });
+
+  it("preserves migrated default tokens and isolates named-account updates and removal", async () => {
+    const stateDir = tempDirs.make("openclaw-msteams-sso-accounts-");
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    const token = {
+      connectionName: "graph",
+      userId: "same-user",
+      token: "legacy-token",
       updatedAt: "2026-04-10T00:00:00.000Z",
+    };
+    const legacyKey =
+      "v2:" +
+      createHash("sha256")
+        .update(JSON.stringify(["graph", "same-user"]))
+        .digest("hex");
+    const legacyStore = createPluginStateKeyedStoreForTests<typeof token>("msteams", {
+      namespace: "sso-tokens",
+      maxEntries: 5000,
+      env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
     });
-    await expect(fs.access(storePath)).rejects.toThrow();
+    await legacyStore.register(legacyKey, token);
+    const defaultStore = createMSTeamsSsoTokenStoreFs({ accountId: "default" });
+    const namedStore = createMSTeamsSsoTokenStoreFs({ accountId: "support" });
+    expect(await defaultStore.get(token)).toEqual(token);
+    expect(await namedStore.get(token)).toBeNull();
+    await namedStore.save({ ...token, token: "named-token" });
+    await closeOpenClawStateDatabaseAsync();
+    resetPluginStateStoreForTests();
+    const reopened = createMSTeamsSsoTokenStoreFs({ accountId: "support" });
+    expect(await reopened.get(token)).toEqual({ ...token, token: "named-token" });
+    expect(await createMSTeamsSsoTokenStoreFs().get(token)).toEqual(token);
+    await reopened.remove(token);
+    expect(await createMSTeamsSsoTokenStoreFs().get(token)).toEqual(token);
   });
 
   it("keeps plugin-state keys bounded for long Teams identifiers", async () => {
-    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-msteams-sso-long-"));
-    const store = createMSTeamsSsoTokenStoreFs({ stateDir });
+    const stateDir = tempDirs.make("openclaw-msteams-sso-long-");
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    const store = createMSTeamsSsoTokenStoreFs();
     const token = {
       connectionName: `conn-${"c".repeat(1000)}`,
       userId: `user-${"u".repeat(2000)}`,
@@ -99,73 +140,5 @@ describe("msteams sso token store (plugin state)", () => {
     expect(await store.get(token)).toEqual(token);
     expect(await store.remove(token)).toBe(true);
     expect(await store.get(token)).toBeNull();
-  });
-
-  it("imports a legacy token file that appears after an empty migration marker", async () => {
-    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-msteams-sso-late-"));
-    const storePath = path.join(stateDir, "msteams-sso-tokens.json");
-    const store = createMSTeamsSsoTokenStoreFs({ storePath });
-
-    expect(await store.get({ connectionName: "conn", userId: "user-late" })).toBeNull();
-    await fs.writeFile(
-      storePath,
-      `${JSON.stringify({
-        version: 1,
-        tokens: {
-          late: {
-            connectionName: "conn",
-            userId: "user-late",
-            token: "token-late",
-            updatedAt: "2026-04-10T00:00:00.000Z",
-          },
-        },
-      })}\n`,
-      "utf8",
-    );
-
-    expect(await store.get({ connectionName: "conn", userId: "user-late" })).toEqual({
-      connectionName: "conn",
-      userId: "user-late",
-      token: "token-late",
-      updatedAt: "2026-04-10T00:00:00.000Z",
-    });
-    await expect(fs.access(storePath)).rejects.toThrow();
-  });
-
-  it("does not resurrect removed tokens when a migrated legacy file cannot be deleted", async () => {
-    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-msteams-sso-stale-"));
-    const storePath = path.join(stateDir, "msteams-sso-tokens.json");
-    await fs.writeFile(
-      storePath,
-      `${JSON.stringify({
-        version: 1,
-        tokens: {
-          stale: {
-            connectionName: "conn",
-            userId: "user-stale",
-            token: "token-stale",
-            updatedAt: "2026-04-10T00:00:00.000Z",
-          },
-        },
-      })}\n`,
-      "utf8",
-    );
-    const originalRm = fs.rm;
-    vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
-      if (target === storePath) {
-        throw new Error("cannot remove");
-      }
-      return await originalRm(target, options);
-    });
-
-    const store = createMSTeamsSsoTokenStoreFs({ storePath });
-    expect(await store.get({ connectionName: "conn", userId: "user-stale" })).toEqual({
-      connectionName: "conn",
-      userId: "user-stale",
-      token: "token-stale",
-      updatedAt: "2026-04-10T00:00:00.000Z",
-    });
-    expect(await store.remove({ connectionName: "conn", userId: "user-stale" })).toBe(true);
-    expect(await store.get({ connectionName: "conn", userId: "user-stale" })).toBeNull();
   });
 });

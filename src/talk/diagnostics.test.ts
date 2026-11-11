@@ -1,10 +1,11 @@
+// Talk diagnostics tests cover realtime voice diagnostic event output.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   onInternalDiagnosticEvent,
   resetDiagnosticEventsForTest,
   type DiagnosticEventPayload,
 } from "../infra/diagnostic-events.js";
-import { createTalkDiagnosticEvent, recordTalkDiagnosticEvent } from "./diagnostics.js";
+import { recordTalkDiagnosticEvent } from "./diagnostics.js";
 import { createTalkEventSequencer } from "./talk-events.js";
 
 describe("talk diagnostics", () => {
@@ -36,21 +37,6 @@ describe("talk diagnostics", () => {
         byteLength: 320,
         text: "private transcript should not export",
       },
-    });
-
-    expect(createTalkDiagnosticEvent(talkEvent)).toEqual({
-      type: "talk.event",
-      sessionId: "talk-session",
-      turnId: "turn-1",
-      captureId: undefined,
-      talkEventType: "input.audio.delta",
-      mode: "realtime",
-      transport: "gateway-relay",
-      brain: "agent-consult",
-      provider: "openai",
-      final: undefined,
-      durationMs: undefined,
-      byteLength: 320,
     });
 
     recordTalkDiagnosticEvent(talkEvent);

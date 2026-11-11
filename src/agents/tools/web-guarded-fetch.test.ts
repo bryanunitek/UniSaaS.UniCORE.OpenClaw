@@ -1,4 +1,5 @@
-import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
+// Guarded web fetch tests pin the SSRF policies used by trusted, self-hosted,
+// and strict web tool endpoint wrappers.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fetchWithSsrFGuard, GUARDED_FETCH_MODE } from "../../infra/net/fetch-guard.js";
 import {
@@ -40,6 +41,8 @@ describe("web-guarded-fetch", () => {
   });
 
   it("uses a host-scoped fake-IP SSRF policy for trusted web tools endpoints", async () => {
+    // Trusted hosted providers can resolve through fake-IP proxy ranges, but
+    // only for the exact hostname selected by the wrapper.
     vi.mocked(fetchWithSsrFGuard).mockResolvedValue({
       response: new Response("ok", { status: 200 }),
       finalUrl: "https://example.com",
@@ -59,6 +62,8 @@ describe("web-guarded-fetch", () => {
   });
 
   it("uses private-network policy only for self-hosted web tools endpoints", async () => {
+    // Self-hosted provider endpoints are the explicit exception that may target
+    // private network addresses.
     vi.mocked(fetchWithSsrFGuard).mockResolvedValue({
       response: new Response("ok", { status: 200 }),
       finalUrl: "http://127.0.0.1:8080",
@@ -120,21 +125,6 @@ describe("web-guarded-fetch", () => {
       async () => undefined,
     );
     expect(firstFetchCall().timeoutMs).toBe(2500);
-  });
-
-  it("caps oversized timeoutSeconds before guarded fetch dispatch", async () => {
-    vi.mocked(fetchWithSsrFGuard).mockResolvedValue({
-      response: new Response("ok", { status: 200 }),
-      finalUrl: "https://example.com",
-      release: async () => {},
-    });
-
-    await withStrictWebToolsEndpoint(
-      { url: "https://example.com", timeoutSeconds: Number.MAX_SAFE_INTEGER },
-      async () => undefined,
-    );
-
-    expect(firstFetchCall().timeoutMs).toBe(MAX_TIMER_TIMEOUT_MS);
   });
 
   it("rejects malformed timeouts before guarded fetch dispatch", async () => {

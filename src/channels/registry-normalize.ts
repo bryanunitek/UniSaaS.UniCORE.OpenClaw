@@ -2,6 +2,7 @@ import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/s
 import type { ChannelId } from "./plugins/channel-id.types.js";
 import { findRegisteredChannelPluginEntry } from "./registry-lookup.js";
 
+/** Normalizes user/config channel identifiers so aliases resolve to canonical channel ids. */
 export function normalizeAnyChannelId(raw?: string | null): ChannelId | null {
   const key = normalizeOptionalLowercaseString(raw);
   if (!key) {

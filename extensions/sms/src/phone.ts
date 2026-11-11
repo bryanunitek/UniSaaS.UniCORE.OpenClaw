@@ -1,5 +1,8 @@
 export function normalizeSmsPhoneNumber(raw: string): string {
-  const trimmed = raw.trim().replace(/^(?:sms|twilio-sms):/i, "");
+  const trimmed = raw
+    .trim()
+    .replace(/^(?:sms|twilio-sms):/i, "")
+    .trim();
   if (!trimmed) {
     return "";
   }
@@ -16,5 +19,5 @@ export function normalizeSmsAllowFrom(raw: string): string {
   if (raw.trim() === "*") {
     return "*";
   }
-  return normalizeSmsPhoneNumber(raw).toLowerCase();
+  return normalizeSmsPhoneNumber(raw);
 }

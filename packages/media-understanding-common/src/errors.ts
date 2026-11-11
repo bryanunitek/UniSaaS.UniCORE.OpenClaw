@@ -6,6 +6,7 @@ type MediaUnderstandingSkipReason =
   | "blocked"
   | "tooSmall";
 
+/** Error used when a media attachment should be skipped without failing the whole request. */
 export class MediaUnderstandingSkipError extends Error {
   readonly reason: MediaUnderstandingSkipReason;
 

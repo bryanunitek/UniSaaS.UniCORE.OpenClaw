@@ -1,5 +1,9 @@
+/**
+ * Public SDK subpath for native command specs, parsing, and authorization helpers.
+ */
 export {
   buildCommandTextFromArgs,
+  canResolveCommandArgMenu,
   findCommandByNativeName,
   formatCommandArgMenuTitle,
   listChatCommands,
@@ -11,6 +15,7 @@ export {
   serializeCommandArgs,
   resolveCommandArgChoices,
   resolveCommandArgMenu,
+  resolveCommandArgMenuAsync,
 } from "../auto-reply/commands-registry.js";
 export type {
   ChatCommandDefinition,
@@ -31,9 +36,24 @@ export {
 export { resolveNativeCommandSessionTargets } from "../channels/native-command-session-targets.js";
 export {
   resolveCommandAuthorization,
+  resolveCommandAuthorizationAsync,
   type CommandAuthorization,
 } from "../auto-reply/command-auth.js";
-export { resolveStoredModelOverride } from "../auto-reply/reply/stored-model-override.js";
-export type { ModelsProviderData } from "../auto-reply/reply/commands-models.js";
-export { listSkillCommandsForAgents } from "../skills/discovery/chat-commands.js";
+export {
+  resolveStoredModelOverride,
+  resolveStoredModelOverrideAsync,
+} from "../sessions/stored-model-overrides.js";
+export { resolveEffectiveAgentRuntime } from "../agents/thinking-runtime.js";
+export {
+  formatFastModeCommandOptions,
+  formatFastModeCurrentStatus,
+  formatFastModeSourceSuffix,
+  formatFastModeStatusValue,
+  resolveFastModeState,
+} from "../agents/fast-mode.js";
+export type { ModelsProviderData } from "../auto-reply/reply/commands-models-catalog.js";
+export {
+  listSkillCommandsForAgents,
+  prepareSkillCommandsForAgents,
+} from "../skills/discovery/chat-commands.js";
 export { listProviderPluginCommandSpecs } from "../plugins/command-specs.js";

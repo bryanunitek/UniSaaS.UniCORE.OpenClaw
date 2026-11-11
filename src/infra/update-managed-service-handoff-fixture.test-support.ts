@@ -1,0 +1,170 @@
+import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { PassThrough } from "node:stream";
+import { afterEach, beforeEach, expect, vi } from "vitest";
+import { closeStateDatabaseForTest } from "../test-utils/database-cleanup.js";
+import {
+  createManagedHandoffTempDirTracker,
+  readManagedHandoffArtifacts,
+} from "./update-managed-service-handoff-artifacts.test-support.js";
+import { createManagedServiceManagerBoundary } from "./update-managed-service-handoff-boundary.test-support.js";
+import { signalMockManagedUpdateHandoffReady } from "./update-managed-service-handoff.test-support.js";
+
+const { forceKillChildProcessTreeMock, resolvePreferredOpenClawTmpDirMock, spawnMock } = vi.hoisted(
+  () => ({
+    forceKillChildProcessTreeMock: vi.fn(),
+    resolvePreferredOpenClawTmpDirMock: vi.fn(),
+    spawnMock: vi.fn(),
+  }),
+);
+
+type MockHandoffChild = EventEmitter & {
+  pid: number;
+  exitCode: null;
+  signalCode: null;
+  stdin: PassThrough;
+  stdout: PassThrough;
+  unref: ReturnType<typeof vi.fn>;
+};
+const mockedChildren = new Set<MockHandoffChild>();
+
+export function createSpawnMock(params?: { pid?: number }): MockHandoffChild {
+  const child = Object.assign(new EventEmitter(), {
+    pid: params?.pid ?? process.pid,
+    exitCode: null,
+    signalCode: null,
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    unref: vi.fn(),
+  });
+  mockedChildren.add(child);
+  return child;
+}
+
+vi.mock("node:child_process", async () => {
+  const { mockNodeChildProcessModule } =
+    await import("../gateway/server-methods/node-child-process.test-support.js");
+  return mockNodeChildProcessModule({
+    spawn: spawnMock as unknown as typeof import("node:child_process").spawn,
+  });
+});
+
+vi.mock("../process/child-process-tree.js", async () => {
+  const actual = await vi.importActual<typeof import("../process/child-process-tree.js")>(
+    "../process/child-process-tree.js",
+  );
+  return { ...actual, forceKillChildProcessTree: forceKillChildProcessTreeMock };
+});
+
+vi.mock("./tmp-openclaw-dir.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./tmp-openclaw-dir.js")>()),
+  resolvePreferredOpenClawTmpDir: resolvePreferredOpenClawTmpDirMock,
+}));
+
+export function useManagedServiceHandoffLifecycleFixture(nativeCoordinator = false) {
+  const originalTempDir = process.env.TMPDIR;
+  const tempDirs = createManagedHandoffTempDirTracker();
+  const managedProcessCleanups = new Set<() => Promise<void>>();
+  const mockedHandoffLeaseCleanups = new Set<() => void>();
+  const mockedHandoffs = new Map<string, { handoffId: string }>();
+  let expectedCancellation: "restored-in-process" | false = "restored-in-process";
+
+  beforeEach(async () => {
+    expectedCancellation = "restored-in-process";
+    // Helpers in one fixture share a coordinator without touching the operator's database.
+    const coordinatorDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-handoff-coordinator-")),
+    );
+    tempDirs.add(coordinatorDir);
+    let coordinator = coordinatorDir;
+    if (nativeCoordinator) {
+      process.env.TMPDIR = coordinatorDir;
+      coordinator = path.join(
+        coordinatorDir,
+        process.getuid ? "openclaw-" + process.getuid() : "openclaw",
+      );
+      await fs.mkdir(coordinator, { mode: 0o700 });
+    }
+    resolvePreferredOpenClawTmpDirMock.mockReturnValue(coordinator);
+    forceKillChildProcessTreeMock.mockReset();
+    spawnMock.mockReset();
+    spawnMock.mockImplementation((_command: string, args: string[]) => {
+      const child = createSpawnMock();
+      const { paramsPath } = readManagedHandoffArtifacts(args);
+      const params = JSON.parse(readFileSync(paramsPath, "utf8")) as {
+        updateLeaseKey: string;
+        handoffId: string;
+      };
+      mockedHandoffs.set(params.updateLeaseKey, { handoffId: params.handoffId });
+      process.nextTick(() => {
+        signalMockManagedUpdateHandoffReady({
+          child,
+          paramsPath,
+          cleanups: mockedHandoffLeaseCleanups,
+        });
+      });
+      return child;
+    });
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    await Promise.all([...managedProcessCleanups].map((cleanup) => cleanup()));
+    managedProcessCleanups.clear();
+    for (const child of mockedChildren) {
+      child.emit("exit", 0, null);
+    }
+    for (const cleanup of mockedHandoffLeaseCleanups) {
+      cleanup();
+    }
+    try {
+      if (mockedHandoffs.size > 0) {
+        const { cancelManagedServiceUpdateHandoff } =
+          await import("./update-managed-service-handoff.js");
+        for (const [installRoot, { handoffId }] of mockedHandoffs) {
+          // Cancellation retires the exited owner only after verifying its lease was released.
+          await expect(
+            cancelManagedServiceUpdateHandoff({
+              kind: "managed-update-handoff",
+              installRoot,
+              handoffId,
+            }),
+          ).resolves.toBe(expectedCancellation);
+        }
+      }
+    } finally {
+      mockedHandoffs.clear();
+      for (const child of mockedChildren) {
+        child.stdin.destroy();
+        child.stdout.destroy();
+      }
+      mockedChildren.clear();
+      await closeStateDatabaseForTest();
+      await tempDirs.cleanup();
+      if (nativeCoordinator) {
+        if (originalTempDir === undefined) {
+          delete process.env.TMPDIR;
+        } else {
+          process.env.TMPDIR = originalTempDir;
+        }
+      }
+    }
+  });
+
+  const runBoundary = createManagedServiceManagerBoundary({
+    spawnMock,
+    tempDirs,
+    cleanups: managedProcessCleanups,
+  });
+  const runManagedServiceManagerBoundary = (...args: Parameters<typeof runBoundary>) => {
+    // An intentionally replaced lease also prevents cleanup from reclaiming the old handoff.
+    if (args[1]?.recoveryInterruption?.effect === "lease-replaced") {
+      expectedCancellation = false;
+    }
+    return runBoundary(...args);
+  };
+  return { forceKillChildProcessTreeMock, spawnMock, tempDirs, runManagedServiceManagerBoundary };
+}

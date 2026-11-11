@@ -1,14 +1,19 @@
+// Message-action param key screening prevents plugin discovery when only
+// standard send/media/threading params are present.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 
 const STANDARD_MESSAGE_ACTION_PARAM_KEYS = new Set([
   "accountId",
+  "action",
   "asDocument",
   "attachments",
   "base64",
   "bestEffort",
+  "buffer",
   "caption",
   "channel",
   "channelId",
+  "clawhub",
   "contentType",
   "delivery",
   "dryRun",
@@ -17,8 +22,12 @@ const STANDARD_MESSAGE_ACTION_PARAM_KEYS = new Set([
   "filename",
   "forceDocument",
   "gifPlayback",
+  "gatewayToken",
+  "gatewayUrl",
   "image",
+  "idempotencyKey",
   "interactive",
+  "json",
   "media",
   "mediaUrl",
   "mediaUrls",
@@ -36,10 +45,12 @@ const STANDARD_MESSAGE_ACTION_PARAM_KEYS = new Set([
   "presentation",
   "replyTo",
   "silent",
+  "senderIsOwner",
   "target",
   "targets",
   "text",
   "threadId",
+  "timeoutMs",
   "topLevel",
   "to",
 ]);
@@ -52,12 +63,10 @@ export function hasPotentialPluginActionParam(params: Record<string, unknown>): 
     if (STANDARD_MESSAGE_ACTION_PARAM_KEYS.has(key)) {
       return false;
     }
-    if (typeof value === "string") {
-      return Boolean(normalizeOptionalString(value));
-    }
-    if (typeof value === "number") {
-      return Number.isFinite(value);
-    }
-    return value !== undefined;
+    return typeof value === "string"
+      ? Boolean(normalizeOptionalString(value))
+      : typeof value === "number"
+        ? Number.isFinite(value)
+        : value !== undefined;
   });
 }

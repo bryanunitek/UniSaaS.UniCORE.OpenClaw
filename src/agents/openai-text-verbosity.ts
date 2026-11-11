@@ -1,3 +1,8 @@
+/**
+ * OpenAI text verbosity normalization for provider-owned stream parameters.
+ *
+ * Invalid operator-supplied values are ignored with a warning instead of leaking into API payloads.
+ */
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import { log } from "./embedded-agent-runner/logger.js";
 
@@ -5,9 +10,6 @@ import { log } from "./embedded-agent-runner/logger.js";
 export type OpenAITextVerbosity = "low" | "medium" | "high";
 
 function normalizeOpenAITextVerbosity(value: unknown): OpenAITextVerbosity | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
   const normalized = normalizeOptionalLowercaseString(value);
   if (normalized === "low" || normalized === "medium" || normalized === "high") {
     return normalized;

@@ -1,12 +1,22 @@
-import fs from "node:fs";
+// Coverage for final bundled-tool policy filtering in embedded runs.
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { setPluginToolMeta } from "../../plugins/tools.js";
+import { replaceSessionEntry } from "../../config/sessions/session-accessor.js";
+import type { SessionEntry } from "../../config/sessions/types.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { setPluginToolMeta } from "../../plugins/tool-metadata.js";
+import { prepareConversationCapabilityProfile } from "../conversation-capability-profile.js";
 import type { AnyAgentTool } from "../tools/common.js";
 import { applyFinalEffectiveToolPolicy } from "./effective-tool-policy.js";
 
+type ConversationCapabilityProfileParams = Parameters<
+  typeof prepareConversationCapabilityProfile
+>[0];
+
 function makeTool(name: string): AnyAgentTool {
+  // Minimal tool shape keeps policy tests independent from executor/runtime
+  // implementations while still exercising plugin metadata.
   return {
     name,
     label: name,
@@ -16,82 +26,71 @@ function makeTool(name: string): AnyAgentTool {
   };
 }
 
+// Mirrors the production composition: resolve the conversation capability
+// profile from server-verified inputs, then apply the final bundled pass.
+async function applyFinalPolicy(
+  params: {
+    bundledTools: AnyAgentTool[];
+    config?: OpenClawConfig;
+    warn?: (message: string) => void;
+  } & Pick<
+    ConversationCapabilityProfileParams,
+    "sessionKey" | "messageProvider" | "senderId" | "groupId" | "groupChannel"
+  >,
+): Promise<AnyAgentTool[]> {
+  const { bundledTools, config, warn, ...profileParams } = params;
+  return applyFinalEffectiveToolPolicy({
+    bundledTools,
+    config,
+    conversationCapabilityProfile: await prepareConversationCapabilityProfile({
+      config,
+      ...profileParams,
+    }),
+    warn: warn ?? (() => {}),
+  });
+}
+
+async function writeSessionEntries(
+  storePath: string,
+  entries: Record<string, unknown>,
+): Promise<void> {
+  for (const [sessionKey, entry] of Object.entries(entries)) {
+    await replaceSessionEntry({ sessionKey, storePath }, entry as SessionEntry);
+  }
+}
+
+function createSessionStorePath(prefix: string, agentId: string): string {
+  return path.join(
+    os.tmpdir(),
+    `${prefix}-${agentId}`,
+    "agents",
+    agentId,
+    "sessions",
+    "sessions.json",
+  );
+}
+
 describe("applyFinalEffectiveToolPolicy", () => {
-  it("filters bundled tools through the configured allowlist", () => {
-    const filtered = applyFinalEffectiveToolPolicy({
-      bundledTools: [makeTool("mcp__bundle__fs_delete"), makeTool("mcp__bundle__fs_read")],
-      config: { tools: { allow: ["mcp__bundle__fs_read"] } },
-      warn: () => {},
-    });
-
-    expect(filtered.map((tool) => tool.name)).toEqual(["mcp__bundle__fs_read"]);
-  });
-
-  it("filters bundled tools through inherited subagent allowlists", () => {
-    const agentId = `bundled-inherited-allow-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const sessionKey = `agent:${agentId}:subagent:limited`;
-    const storePath = path.join(os.tmpdir(), `openclaw-bundled-inherited-allow-${agentId}.json`);
-    fs.writeFileSync(
-      storePath,
-      JSON.stringify(
-        {
-          [sessionKey]: {
-            sessionId: "limited-session",
-            updatedAt: Date.now(),
-            spawnDepth: 1,
-            subagentRole: "orchestrator",
-            subagentControlScope: "children",
-            inheritedToolAllow: ["mcp__bundle__fs_read"],
-          },
-        },
-        null,
-        2,
-      ),
-      "utf-8",
-    );
-
-    const filtered = applyFinalEffectiveToolPolicy({
-      bundledTools: [makeTool("mcp__bundle__fs_delete"), makeTool("mcp__bundle__fs_read")],
-      config: {
-        session: {
-          store: storePath,
-        },
-      },
-      sessionKey,
-      warn: () => {},
-    });
-
-    expect(filtered.map((tool) => tool.name)).toEqual(["mcp__bundle__fs_read"]);
-  });
-
-  it("honors configured plugin allow entries alongside inherited bundled tool allows", () => {
+  it("honors configured plugin allow entries alongside inherited bundled tool allows", async () => {
     const agentId = `bundled-plugin-allow-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const sessionKey = `agent:${agentId}:subagent:limited`;
-    const storePath = path.join(os.tmpdir(), `openclaw-bundled-plugin-allow-${agentId}.json`);
-    fs.writeFileSync(
-      storePath,
-      JSON.stringify(
-        {
-          [sessionKey]: {
-            sessionId: "limited-session",
-            updatedAt: Date.now(),
-            spawnDepth: 1,
-            subagentRole: "orchestrator",
-            subagentControlScope: "children",
-            inheritedToolAllow: ["mcp__bundle__fs_read"],
-          },
-        },
-        null,
-        2,
-      ),
-      "utf-8",
-    );
+    const storePath = createSessionStorePath("openclaw-bundled-plugin-allow", agentId);
+    await writeSessionEntries(storePath, {
+      [sessionKey]: {
+        sessionId: "limited-session",
+        updatedAt: Date.now(),
+        spawnDepth: 1,
+        subagentRole: "orchestrator",
+        subagentControlScope: "children",
+        inheritedToolAllow: ["mcp__bundle__fs_read"],
+      },
+    });
     const deniedTool = makeTool("mcp__bundle__fs_delete");
     const allowedTool = makeTool("mcp__bundle__fs_read");
     setPluginToolMeta(deniedTool, { pluginId: "bundle-mcp", optional: false });
     setPluginToolMeta(allowedTool, { pluginId: "bundle-mcp", optional: false });
 
-    const filtered = applyFinalEffectiveToolPolicy({
+    const filtered = await applyFinalPolicy({
       bundledTools: [deniedTool, allowedTool],
       config: {
         session: {
@@ -112,8 +111,10 @@ describe("applyFinalEffectiveToolPolicy", () => {
     expect(filtered.map((tool) => tool.name)).toEqual(["mcp__bundle__fs_read"]);
   });
 
-  it("applies channel-normalized per-sender policy to bundled tools", () => {
-    const filtered = applyFinalEffectiveToolPolicy({
+  it("applies channel-normalized per-sender policy to bundled tools", async () => {
+    // Teams normalizes to msteams in policy keys, which must happen before
+    // sender-specific deny rules are applied.
+    const filtered = await applyFinalPolicy({
       bundledTools: [makeTool("mcp__bundle__exec"), makeTool("mcp__bundle__read")],
       config: {
         tools: {
@@ -130,8 +131,8 @@ describe("applyFinalEffectiveToolPolicy", () => {
     expect(filtered.map((tool) => tool.name)).toEqual(["mcp__bundle__read"]);
   });
 
-  it("returns the empty array unchanged when there are no bundled tools", () => {
-    const filtered = applyFinalEffectiveToolPolicy({
+  it("returns the empty array unchanged when there are no bundled tools", async () => {
+    const filtered = await applyFinalPolicy({
       bundledTools: [],
       config: { tools: { allow: ["message"] } },
       warn: () => {},
@@ -140,9 +141,9 @@ describe("applyFinalEffectiveToolPolicy", () => {
     expect(filtered).toStrictEqual([]);
   });
 
-  it("drops caller-provided groupId when it disagrees with session-derived group context", () => {
+  it("drops caller-provided groupId when it disagrees with session-derived group context", async () => {
     const warnings: string[] = [];
-    applyFinalEffectiveToolPolicy({
+    await applyFinalPolicy({
       bundledTools: [makeTool("mcp__bundle__read")],
       // Session key encodes a concrete group (discord room 111); caller tries
       // to override with a different group id so a more permissive group
@@ -158,9 +159,9 @@ describe("applyFinalEffectiveToolPolicy", () => {
     );
   });
 
-  it("drops caller-provided groupId when session encodes no group context (fail-closed)", () => {
+  it("drops caller-provided groupId when session encodes no group context (fail-closed)", async () => {
     const warnings: string[] = [];
-    applyFinalEffectiveToolPolicy({
+    await applyFinalPolicy({
       bundledTools: [makeTool("mcp__bundle__read")],
       // Direct/non-group session key: no session-derived group ids. A caller
       // supplying a groupId here has no server-verified ground truth; it
@@ -176,22 +177,9 @@ describe("applyFinalEffectiveToolPolicy", () => {
     );
   });
 
-  it("leaves groupId untouched when caller did not supply one", () => {
+  it("does not emit unknown-entry warnings for core tool allowlists in the bundled pass", async () => {
     const warnings: string[] = [];
-    applyFinalEffectiveToolPolicy({
-      bundledTools: [makeTool("mcp__bundle__read")],
-      sessionKey: "agent:alice:main",
-      warn: (message) => warnings.push(message),
-    });
-
-    expect(warnings).not.toContain(
-      "effective tool policy: dropping caller-provided groupId that does not match session-derived group context",
-    );
-  });
-
-  it("does not emit unknown-entry warnings for core tool allowlists in the bundled pass", () => {
-    const warnings: string[] = [];
-    applyFinalEffectiveToolPolicy({
+    await applyFinalPolicy({
       bundledTools: [makeTool("mcp__bundle__read")],
       // Core tool names like `read` and `exec` are not in the bundled-only
       // input here, but they are valid core tools resolved by the first
@@ -203,9 +191,9 @@ describe("applyFinalEffectiveToolPolicy", () => {
     expect(warnings.filter((message) => message.includes("unknown entries"))).toStrictEqual([]);
   });
 
-  it("still warns on genuinely unknown entries in the bundled pass", () => {
+  it("still warns on genuinely unknown entries in the bundled pass", async () => {
     const warnings: string[] = [];
-    applyFinalEffectiveToolPolicy({
+    await applyFinalPolicy({
       bundledTools: [makeTool("mcp__bundle__read")],
       config: { tools: { allow: ["mcp__bundle__read", "totally-made-up-tool"] } },
       warn: (message) => warnings.push(message),
@@ -214,11 +202,11 @@ describe("applyFinalEffectiveToolPolicy", () => {
     expect(warnings.filter((message) => message.includes("totally-made-up-tool"))).toHaveLength(1);
   });
 
-  it("keeps bundle MCP tools in the coding profile via plugin metadata", () => {
+  it("keeps bundle MCP tools in the coding profile via plugin metadata", async () => {
     const mcpTool = makeTool("bundleProbe__bundle_probe");
     setPluginToolMeta(mcpTool, { pluginId: "bundle-mcp", optional: false });
 
-    const filtered = applyFinalEffectiveToolPolicy({
+    const filtered = await applyFinalPolicy({
       bundledTools: [mcpTool],
       config: { tools: { profile: "coding" } },
       warn: () => {},
@@ -227,11 +215,11 @@ describe("applyFinalEffectiveToolPolicy", () => {
     expect(filtered.map((tool) => tool.name)).toEqual(["bundleProbe__bundle_probe"]);
   });
 
-  it("lets explicit deny entries override the profile bundle MCP allowlist", () => {
+  it("lets explicit deny entries override the profile bundle MCP allowlist", async () => {
     const mcpTool = makeTool("bundleProbe__bundle_probe");
     setPluginToolMeta(mcpTool, { pluginId: "bundle-mcp", optional: false });
 
-    const filtered = applyFinalEffectiveToolPolicy({
+    const filtered = await applyFinalPolicy({
       bundledTools: [mcpTool],
       config: { tools: { profile: "coding", deny: ["bundle-mcp"] } },
       warn: () => {},

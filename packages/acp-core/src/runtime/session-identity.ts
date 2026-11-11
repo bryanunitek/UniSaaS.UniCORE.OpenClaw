@@ -1,36 +1,25 @@
-import { normalizeText } from "../normalize-text.js";
+import { asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
+import { normalizeOptionalString as normalizeText } from "@openclaw/normalization-core/string-coerce";
 import type { SessionAcpIdentity, SessionAcpIdentitySource, SessionAcpMeta } from "../types.js";
 import type { AcpRuntimeHandle, AcpRuntimeStatus } from "./types.js";
 
-function normalizeIdentityState(value: unknown): SessionAcpIdentity["state"] | undefined {
-  if (value !== "pending" && value !== "resolved") {
-    return undefined;
-  }
-  return value;
-}
-
-function normalizeIdentitySource(value: unknown): SessionAcpIdentitySource | undefined {
-  if (value !== "ensure" && value !== "status" && value !== "event") {
-    return undefined;
-  }
-  return value;
-}
-
+/** Normalize an identity object and infer pending/resolved state from stable ids. */
 function normalizeIdentity(
   identity: SessionAcpIdentity | undefined,
 ): SessionAcpIdentity | undefined {
   if (!identity) {
     return undefined;
   }
-  const state = normalizeIdentityState(identity.state);
-  const source = normalizeIdentitySource(identity.source);
+  const state =
+    identity.state === "pending" || identity.state === "resolved" ? identity.state : undefined;
+  const source =
+    identity.source === "ensure" || identity.source === "status" || identity.source === "event"
+      ? identity.source
+      : undefined;
   const acpxRecordId = normalizeText(identity.acpxRecordId);
   const acpxSessionId = normalizeText(identity.acpxSessionId);
   const agentSessionId = normalizeText(identity.agentSessionId);
-  const lastUpdatedAt =
-    typeof identity.lastUpdatedAt === "number" && Number.isFinite(identity.lastUpdatedAt)
-      ? identity.lastUpdatedAt
-      : undefined;
+  const lastUpdatedAt = asFiniteNumber(identity.lastUpdatedAt);
   const hasAnyId = Boolean(acpxRecordId || acpxSessionId || agentSessionId);
   if (!state && !source && !hasAnyId && lastUpdatedAt === undefined) {
     return undefined;
@@ -51,12 +40,13 @@ type IdentityIds = Pick<SessionAcpIdentity, "acpxRecordId" | "acpxSessionId" | "
 
 function readIdentityIdsFromHandle(handle: AcpRuntimeHandle): IdentityIds {
   return {
-    acpxRecordId: normalizeText((handle as { acpxRecordId?: unknown }).acpxRecordId),
+    acpxRecordId: normalizeText(handle.acpxRecordId),
     acpxSessionId: normalizeText(handle.backendSessionId),
     agentSessionId: normalizeText(handle.agentSessionId),
   };
 }
 
+/** Build an identity only when at least one stable id is known. */
 function buildSessionIdentity(params: {
   ids: IdentityIds;
   state: SessionAcpIdentity["state"];
@@ -80,43 +70,33 @@ function buildSessionIdentity(params: {
 export function resolveSessionIdentityFromMeta(
   meta: SessionAcpMeta | undefined,
 ): SessionAcpIdentity | undefined {
-  if (!meta) {
-    return undefined;
-  }
-  return normalizeIdentity(meta.identity);
+  return normalizeIdentity(meta?.identity);
 }
 
 export function identityHasStableSessionId(identity: SessionAcpIdentity | undefined): boolean {
   return Boolean(identity?.acpxSessionId || identity?.agentSessionId);
 }
 
+/** Resolve the runtime resume id, preferring agent session id over ACP backend id. */
 export function resolveRuntimeResumeSessionId(
   identity: SessionAcpIdentity | undefined,
 ): string | undefined {
-  if (!identity) {
-    return undefined;
-  }
-  return normalizeText(identity.agentSessionId) ?? normalizeText(identity.acpxSessionId);
+  return normalizeText(identity?.agentSessionId) ?? normalizeText(identity?.acpxSessionId);
 }
 
 export function isSessionIdentityPending(identity: SessionAcpIdentity | undefined): boolean {
-  if (!identity) {
-    return true;
-  }
-  return identity.state === "pending";
+  return !identity || identity.state === "pending";
 }
 
+/** Compare identities ignoring lastUpdatedAt timestamp churn. */
 export function identityEquals(
   left: SessionAcpIdentity | undefined,
   right: SessionAcpIdentity | undefined,
 ): boolean {
   const a = normalizeIdentity(left);
   const b = normalizeIdentity(right);
-  if (!a && !b) {
-    return true;
-  }
   if (!a || !b) {
-    return false;
+    return a === b;
   }
   return (
     a.state === b.state &&
@@ -127,6 +107,7 @@ export function identityEquals(
   );
 }
 
+/** Merge current and incoming identity observations without downgrading resolved ids. */
 export function mergeSessionIdentity(params: {
   current: SessionAcpIdentity | undefined;
   incoming: SessionAcpIdentity | undefined;
@@ -157,13 +138,9 @@ export function mergeSessionIdentity(params: {
       : current.agentSessionId;
 
   const nextResolved = Boolean(nextAcpxSessionId || nextAgentSessionId);
-  const nextState: SessionAcpIdentity["state"] = nextResolved
-    ? "resolved"
-    : currentResolved
-      ? "resolved"
-      : incoming.state;
+  const nextState = nextResolved || currentResolved ? "resolved" : incoming.state;
   const nextSource = allowIncomingValue ? incoming.source : current.source;
-  const next: SessionAcpIdentity = {
+  return {
     state: nextState,
     ...(nextRecordId ? { acpxRecordId: nextRecordId } : {}),
     ...(nextAcpxSessionId ? { acpxSessionId: nextAcpxSessionId } : {}),
@@ -171,9 +148,9 @@ export function mergeSessionIdentity(params: {
     source: nextSource,
     lastUpdatedAt: params.now,
   };
-  return next;
 }
 
+/** Create a pending identity from an ensure-session handle. */
 export function createIdentityFromEnsure(params: {
   handle: AcpRuntimeHandle;
   now: number;
@@ -208,26 +185,19 @@ export function createIdentityFromStatus(params: {
   }
   const details = params.status.details;
   const acpxRecordId =
-    normalizeText((params.status as { acpxRecordId?: unknown }).acpxRecordId) ??
-    normalizeText(details?.acpxRecordId);
+    normalizeText(params.status.acpxRecordId) ?? normalizeText(details?.acpxRecordId);
   const acpxSessionId =
     normalizeText(params.status.backendSessionId) ??
     normalizeText(details?.backendSessionId) ??
     normalizeText(details?.acpxSessionId);
   const agentSessionId =
     normalizeText(params.status.agentSessionId) ?? normalizeText(details?.agentSessionId);
-  if (!acpxRecordId && !acpxSessionId && !agentSessionId) {
-    return undefined;
-  }
-  const resolved = Boolean(acpxSessionId || agentSessionId);
-  return {
-    state: resolved ? "resolved" : "pending",
-    ...(acpxRecordId ? { acpxRecordId } : {}),
-    ...(acpxSessionId ? { acpxSessionId } : {}),
-    ...(agentSessionId ? { agentSessionId } : {}),
+  return buildSessionIdentity({
+    ids: { acpxRecordId, acpxSessionId, agentSessionId },
+    state: acpxSessionId || agentSessionId ? "resolved" : "pending",
     source: "status",
-    lastUpdatedAt: params.now,
-  };
+    now: params.now,
+  });
 }
 
 export function resolveRuntimeHandleIdentifiersFromIdentity(

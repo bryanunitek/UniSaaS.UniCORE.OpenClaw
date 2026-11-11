@@ -1,4 +1,8 @@
+/**
+ * Runtime SDK subpath for shared slug and string-entry normalization helpers.
+ */
 export {
+  containsAsciiControlCharacter,
   normalizeAtHashSlug,
   normalizeHyphenSlug,
   normalizeStringEntries,

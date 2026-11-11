@@ -1,9 +1,10 @@
+// Coverage for embedded attempt tool construction and runtime allowlists.
 import { describe, expect, it } from "vitest";
+import { attachToolAllowlistIntersection } from "../../tool-policy.js";
 import {
   applyEmbeddedAttemptToolsAllow,
   mergeForcedEmbeddedAttemptToolsAllow,
   resolveEmbeddedAttemptToolConstructionPlan,
-  shouldBuildCoreCodingToolsForAllowlist,
   shouldCreateBundleLspRuntimeForAttempt,
   shouldCreateBundleMcpRuntimeForAttempt,
 } from "./attempt-tool-construction-plan.js";
@@ -21,6 +22,8 @@ function expectConstructionPlan(
     coding?: Partial<EmbeddedAttemptToolConstructionPlan["codingToolConstructionPlan"]>;
   },
 ) {
+  // Plans are intentionally wide; tests assert only the decision bits relevant
+  // to the scenario under review.
   if ("constructTools" in expected) {
     expect(plan.constructTools).toBe(expected.constructTools);
   }
@@ -38,45 +41,34 @@ function expectConstructionPlan(
 }
 
 describe("applyEmbeddedAttemptToolsAllow", () => {
-  it("keeps explicit toolsAllow authoritative after force-added tools are built", () => {
-    const tools = [{ name: "exec" }, { name: "read" }, { name: "message" }];
-
-    expect(
-      applyEmbeddedAttemptToolsAllow(tools, ["exec", "read"]).map((tool) => tool.name),
-    ).toEqual(["exec", "read"]);
-  });
-
-  it("keeps forced message tool through explicit runtime allowlists", () => {
-    const tools = [{ name: "music_generate" }, { name: "message" }];
-    const toolsAllow = mergeForcedEmbeddedAttemptToolsAllow(["music_generate"], {
-      forceMessageTool: true,
-    });
-
-    expect(toolsAllow).toEqual(["music_generate", "message"]);
-    expect(applyEmbeddedAttemptToolsAllow(tools, toolsAllow).map((tool) => tool.name)).toEqual([
-      "music_generate",
-      "message",
-    ]);
-  });
-
-  it("materializes forced message tool through empty runtime allowlists", () => {
-    const tools = [{ name: "music_generate" }, { name: "message" }];
+  it("materializes host-required collector output through empty runtime allowlists", () => {
+    const tools = [{ name: "structured_output" }, { name: "read" }];
     const toolsAllow = mergeForcedEmbeddedAttemptToolsAllow([], {
-      forceMessageTool: true,
+      forceToolNames: ["structured_output"],
     });
 
-    expect(toolsAllow).toEqual(["message"]);
+    expect(toolsAllow).toEqual(["structured_output"]);
     expect(applyEmbeddedAttemptToolsAllow(tools, toolsAllow).map((tool) => tool.name)).toEqual([
-      "message",
+      "structured_output",
     ]);
+    expect(resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow })).toMatchObject({
+      constructTools: true,
+      includeCoreTools: true,
+      codingToolConstructionPlan: { includeOpenClawTools: true },
+    });
   });
 
-  it("normalizes explicit toolsAllow entries before filtering", () => {
-    const tools = [{ name: "cron" }, { name: "read" }, { name: "message" }];
+  it("keeps forced tools through preserved hook intersections", () => {
+    const tools = [{ name: "web_search" }, { name: "message" }, { name: "read" }];
+    const toolsAllow = mergeForcedEmbeddedAttemptToolsAllow(
+      attachToolAllowlistIntersection([], [["web_*"], ["*_search"]]),
+      { forceMessageTool: true },
+    );
 
-    expect(
-      applyEmbeddedAttemptToolsAllow(tools, [" cron ", "READ"]).map((tool) => tool.name),
-    ).toEqual(["cron", "read"]);
+    expect(applyEmbeddedAttemptToolsAllow(tools, toolsAllow).map((tool) => tool.name)).toEqual([
+      "web_search",
+      "message",
+    ]);
   });
 
   it("honors wildcard and group allowlists in the final filter", () => {
@@ -87,18 +79,21 @@ describe("applyEmbeddedAttemptToolsAllow", () => {
       "read",
       "message",
     ]);
+    expect(applyEmbeddedAttemptToolsAllow(tools, ["exec*"]).map((tool) => tool.name)).toEqual([
+      "exec",
+    ]);
     expect(applyEmbeddedAttemptToolsAllow(tools, ["group:fs"]).map((tool) => tool.name)).toEqual([
       "read",
     ]);
   });
 
-  it("keeps plugin-only allowlists on the shared tool policy path", () => {
-    const tools = [{ name: "memory_search" }, { name: "plugin_extra" }];
+  it("preserves runtime write compatibility in the final filter", () => {
+    const tools = [{ name: "write" }, { name: "apply_patch" }, { name: "exec" }];
 
-    expect(shouldBuildCoreCodingToolsForAllowlist(["memory_search"])).toBe(false);
-    expect(
-      applyEmbeddedAttemptToolsAllow(tools, ["memory_search"]).map((tool) => tool.name),
-    ).toEqual(["memory_search"]);
+    expect(applyEmbeddedAttemptToolsAllow(tools, ["write"]).map((tool) => tool.name)).toEqual([
+      "write",
+      "apply_patch",
+    ]);
   });
 
   it("expands plugin group and plugin-id allowlists before the final filter", () => {
@@ -131,6 +126,8 @@ describe("applyEmbeddedAttemptToolsAllow", () => {
   });
 
   it("filters bundled runtime tools by explicit tool name and bundled plugin id", () => {
+    // Bundled MCP/LSP tools are plugin-owned tools, so allowlists can target
+    // either exact tool names or bundled plugin ids.
     const tools = [
       { name: "strict__strict_probe" },
       { name: "loose__extra_probe" },
@@ -166,7 +163,10 @@ describe("applyEmbeddedAttemptToolsAllow", () => {
     const tools = [{ name: "exec" }, { name: "read" }, { name: "message" }];
 
     expect(applyEmbeddedAttemptToolsAllow(tools, []).map((tool) => tool.name)).toStrictEqual([]);
-    expect(shouldBuildCoreCodingToolsForAllowlist([])).toBe(false);
+    expect(resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: [] })).toHaveProperty(
+      "includeCoreTools",
+      false,
+    );
   });
 });
 
@@ -185,51 +185,23 @@ describe("resolveEmbeddedAttemptToolConstructionPlan", () => {
     });
   });
 
-  it("short-circuits all local tool construction for explicit no-tools runs", () => {
-    expectConstructionPlan(resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: [] }), {
-      constructTools: false,
-      includeCoreTools: false,
-      coding: {
-        includeBaseCodingTools: false,
-        includeShellTools: false,
-        includeChannelTools: false,
-        includeOpenClawTools: false,
-        includePluginTools: false,
-      },
-    });
-  });
-
-  it("constructs message tool for forced message delivery on explicit no-tools runs", () => {
+  it("short-circuits tool construction when the model disables tools", () => {
     expectConstructionPlan(
-      resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: [], forceMessageTool: true }),
+      resolveEmbeddedAttemptToolConstructionPlan({
+        toolsEnabled: false,
+        toolsAllow: ["message"],
+        forceMessageTool: true,
+      }),
       {
-        constructTools: true,
-        includeCoreTools: true,
-        runtimeToolAllowlist: ["message"],
+        constructTools: false,
+        includeCoreTools: false,
+        runtimeToolAllowlist: undefined,
         coding: {
           includeBaseCodingTools: false,
           includeShellTools: false,
           includeChannelTools: false,
-          includeOpenClawTools: true,
-          includePluginTools: false,
-        },
-      },
-    );
-  });
-
-  it("materializes only plugin candidates for plugin-only allowlists", () => {
-    expectConstructionPlan(
-      resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["memory_search"] }),
-      {
-        constructTools: true,
-        includeCoreTools: false,
-        runtimeToolAllowlist: ["memory_search"],
-        coding: {
-          includeBaseCodingTools: false,
-          includeShellTools: false,
-          includeChannelTools: true,
           includeOpenClawTools: false,
-          includePluginTools: true,
+          includePluginTools: false,
         },
       },
     );
@@ -256,139 +228,55 @@ describe("resolveEmbeddedAttemptToolConstructionPlan", () => {
     );
   });
 
-  it("limits known core allowlists to the matching local families", () => {
-    expectConstructionPlan(resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["read"] }), {
-      constructTools: true,
+  it("honors runtime-cap intersections when selecting core families", () => {
+    expectConstructionPlan(resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["write"] }), {
       includeCoreTools: true,
       coding: {
         includeBaseCodingTools: true,
         includeShellTools: false,
-        includeChannelTools: false,
         includeOpenClawTools: false,
-        includePluginTools: false,
       },
     });
-    expectConstructionPlan(resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["exec"] }), {
-      coding: {
-        includeBaseCodingTools: false,
-        includeShellTools: true,
-        includeChannelTools: false,
-        includeOpenClawTools: false,
-        includePluginTools: false,
-      },
-    });
+
+    const narrowedWildcard = attachToolAllowlistIntersection(["*", "write"], [["*"], ["write"]]);
     expectConstructionPlan(
-      resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["session_status"] }),
+      resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: narrowedWildcard }),
       {
-        coding: {
-          includeBaseCodingTools: false,
-          includeShellTools: false,
-          includeChannelTools: false,
-          includeOpenClawTools: true,
-          includePluginTools: false,
-        },
-      },
-    );
-    expectConstructionPlan(
-      resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["update_plan"] }),
-      {
-        coding: {
-          includeBaseCodingTools: false,
-          includeShellTools: false,
-          includeChannelTools: false,
-          includeOpenClawTools: true,
-          includePluginTools: false,
-        },
-      },
-    );
-    expectConstructionPlan(
-      resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["skill_workshop"] }),
-      {
-        constructTools: true,
         includeCoreTools: true,
-        runtimeToolAllowlist: ["skill_workshop"],
         coding: {
-          includeBaseCodingTools: false,
+          includeBaseCodingTools: true,
           includeShellTools: false,
-          includeChannelTools: false,
-          includeOpenClawTools: true,
-          includePluginTools: false,
+          includeOpenClawTools: false,
         },
       },
     );
-  });
 
-  it("keeps plugin-owned catalog tools on the plugin construction path", () => {
+    const overlappingGlobs = attachToolAllowlistIntersection([], [["exec*"], ["*xec"]]);
     expectConstructionPlan(
-      resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["browser"] }),
+      resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: overlappingGlobs }),
       {
-        constructTools: true,
-        includeCoreTools: false,
+        includeCoreTools: true,
         coding: {
           includeBaseCodingTools: false,
-          includeShellTools: false,
-          includeChannelTools: true,
+          includeShellTools: true,
           includeOpenClawTools: false,
-          includePluginTools: true,
         },
-      },
-    );
-    expectConstructionPlan(
-      resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["code_execution"] }),
-      {
-        constructTools: true,
-        includeCoreTools: false,
-        coding: {
-          includeBaseCodingTools: false,
-          includeShellTools: false,
-          includeChannelTools: true,
-          includeOpenClawTools: false,
-          includePluginTools: true,
-        },
-      },
-    );
-    expectConstructionPlan(
-      resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["x_search"] }),
-      {
-        includeCoreTools: false,
-        coding: {
-          includeChannelTools: true,
-          includeOpenClawTools: false,
-          includePluginTools: true,
-        },
-      },
-    );
-  });
-
-  it("keeps channel tools available for narrow channel-owned allowlists", () => {
-    expectConstructionPlan(
-      resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["whatsapp_login"] }),
-      {
-        constructTools: true,
-        includeCoreTools: false,
-        coding: {
-          includeBaseCodingTools: false,
-          includeShellTools: false,
-          includeChannelTools: true,
-          includeOpenClawTools: false,
-          includePluginTools: true,
-        },
-      },
-    );
-  });
-
-  it("skips local construction when only bundled tool runtimes can match", () => {
-    expectConstructionPlan(
-      resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["strict__strict_probe"] }),
-      {
-        constructTools: false,
-        includeCoreTools: false,
       },
     );
   });
 });
 
 describe("shouldCreateBundleMcpRuntimeForAttempt", () => {
+  it("does not treat a generated bash namespace as the core exec alias", () => {
+    expect(
+      shouldCreateBundleMcpRuntimeForAttempt({
+        toolsEnabled: true,
+        toolsAllow: ["exec*"],
+        resolveConfiguredMcpNamespaces: () => ["bash__"],
+      }),
+    ).toBe(false);
+  });
+
   it("skips bundle MCP runtime when tools are disabled", () => {
     expect(shouldCreateBundleMcpRuntimeForAttempt({ toolsEnabled: false })).toBe(false);
     expect(shouldCreateBundleMcpRuntimeForAttempt({ toolsEnabled: true, disableTools: true })).toBe(

@@ -1,18 +1,62 @@
 import { addTimerTimeoutGraceMs, resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
+import type { CodexAppServerClient } from "./client.js";
+import { codexPrewriteRejectionCause } from "./rpc-error.js";
 
-export const CODEX_APP_SERVER_STARTUP_TIMEOUT_FLOOR_MS = 100;
-export const CODEX_TURN_COMPLETION_IDLE_TIMEOUT_MS = 60_000;
-export const CODEX_TURN_ASSISTANT_COMPLETION_IDLE_TIMEOUT_MS = 10_000;
-// Native Codex can stream a large custom tool input after a raw assistant
-// progress item. Forwarded deltas count as activity, but older native paths may
-// not surface them, so keep this terminal guard conservative.
-export const CODEX_POST_TOOL_RAW_ASSISTANT_COMPLETION_IDLE_TIMEOUT_MS = 5 * 60_000;
-export const CODEX_POST_REASONING_REPLY_IDLE_TIMEOUT_MS = 5 * 60_000;
-export const CODEX_TURN_TERMINAL_IDLE_TIMEOUT_MS = 30 * 60_000;
+const CODEX_APP_SERVER_STARTUP_TIMEOUT_FLOOR_MS = 100;
+// Startup issues several sequential app-server requests across up to three
+// attempts and may wait for a retired owner's exit. Observed startups take
+// seconds to a few minutes; ten request timeouts stays generous on slow hosts.
+const CODEX_APP_SERVER_STARTUP_REQUEST_TIMEOUT_MULTIPLE = 10;
+// Native terminal receipt must still reach local settlement; a blocked
+// projection must not retain the session lane indefinitely.
+export const TURN_TERMINAL_SETTLEMENT_TIMEOUT_MS = 2 * 60_000;
+// Aborted/timed-out completions still join queued projection work; this grace
+// bounds a blocked handler tail so finalization cannot hang forever.
+export const TURN_FINALIZE_DRAIN_ABORT_GRACE_MS = 5_000;
 
-function resolvePositiveIntegerTimeoutMs(value: number | undefined, fallbackMs: number): number {
-  const fallback = resolveTimerTimeoutMs(fallbackMs, 1);
-  return resolveTimerTimeoutMs(value, fallback);
+export const CODEX_APP_SERVER_INITIALIZE_TIMEOUT_MESSAGE = "codex app-server initialize timed out";
+
+type CodexAppServerStartupErrorReason = "aborted" | "timed_out";
+
+export class CodexAppServerStartupError extends Error {
+  readonly code = "CODEX_APP_SERVER_STARTUP_CANCELLED";
+
+  constructor(
+    readonly reason: CodexAppServerStartupErrorReason,
+    message = reason === "timed_out"
+      ? "codex app-server startup timed out"
+      : "codex app-server startup aborted",
+  ) {
+    super(message);
+    this.name = "CodexAppServerStartupError";
+  }
+}
+
+export function buildCodexAppServerInitializeTimeoutError(
+  client: CodexAppServerClient | undefined,
+): CodexAppServerStartupError {
+  const stderr = client?.getStderrDiagnostic();
+  return new CodexAppServerStartupError(
+    "timed_out",
+    stderr
+      ? `${CODEX_APP_SERVER_INITIALIZE_TIMEOUT_MESSAGE}; stderr=${JSON.stringify(stderr)}`
+      : CODEX_APP_SERVER_INITIALIZE_TIMEOUT_MESSAGE,
+  );
+}
+
+export function isCodexAppServerStartupError(
+  error: unknown,
+  reason?: CodexAppServerStartupErrorReason,
+): boolean {
+  const cause = codexPrewriteRejectionCause(error);
+  return (
+    cause instanceof Error &&
+    "code" in cause &&
+    cause.code === "CODEX_APP_SERVER_STARTUP_CANCELLED" &&
+    "reason" in cause &&
+    (cause.reason === "aborted" || cause.reason === "timed_out") &&
+    (reason === undefined || cause.reason === reason)
+  );
 }
 
 export async function withCodexStartupTimeout<T>(params: {
@@ -22,7 +66,7 @@ export async function withCodexStartupTimeout<T>(params: {
   operation: () => Promise<T>;
 }): Promise<T> {
   if (params.signal.aborted) {
-    throw new Error("codex app-server startup aborted");
+    throw new CodexAppServerStartupError("aborted");
   }
   let timeout: NodeJS.Timeout | undefined;
   let abortCleanup: (() => void) | undefined;
@@ -33,14 +77,12 @@ export async function withCodexStartupTimeout<T>(params: {
       params.operation(),
       new Promise<never>((_, reject) => {
         const rejectOnce = (error: Error) => {
-          if (timeout) {
-            clearTimeout(timeout);
-            timeout = undefined;
-          }
+          clearTimeout(timeout);
+          timeout = undefined;
           reject(error);
         };
         timeout = setTimeout(() => {
-          timeoutError = new Error("codex app-server startup timed out");
+          timeoutError = new CodexAppServerStartupError("timed_out");
           timeoutCleanup = Promise.resolve(params.onTimeout?.()).then(
             () => undefined,
             () => undefined,
@@ -49,7 +91,7 @@ export async function withCodexStartupTimeout<T>(params: {
             rejectOnce(timeoutError!);
           });
         }, params.timeoutMs);
-        const abortListener = () => rejectOnce(new Error("codex app-server startup aborted"));
+        const abortListener = () => rejectOnce(new CodexAppServerStartupError("aborted"));
         params.signal.addEventListener("abort", abortListener, { once: true });
         abortCleanup = () => params.signal.removeEventListener("abort", abortListener);
       }),
@@ -61,52 +103,37 @@ export async function withCodexStartupTimeout<T>(params: {
     }
     throw error;
   } finally {
-    if (timeout) {
-      clearTimeout(timeout);
-    }
+    clearTimeout(timeout);
     abortCleanup?.();
   }
 }
 
+/**
+ * Bounds app-server startup by the turn budget and, when known, by a multiple of
+ * the per-request timeout, so a turn with a long budget cannot hang silently in startup.
+ */
 export function resolveCodexStartupTimeoutMs(params: {
   timeoutMs: number;
+  requestTimeoutMs?: number;
   timeoutFloorMs?: number;
 }): number {
-  const timeoutFloorMs = resolvePositiveIntegerTimeoutMs(
+  const timeoutFloorMs = resolveTimerTimeoutMs(
     params.timeoutFloorMs,
     CODEX_APP_SERVER_STARTUP_TIMEOUT_FLOOR_MS,
   );
-  const timeoutMs = resolvePositiveIntegerTimeoutMs(params.timeoutMs, timeoutFloorMs);
-  return Math.max(timeoutFloorMs, timeoutMs);
-}
-
-export function resolveCodexTurnCompletionIdleTimeoutMs(value: number | undefined): number {
-  return resolvePositiveIntegerTimeoutMs(value, CODEX_TURN_COMPLETION_IDLE_TIMEOUT_MS);
-}
-
-export function resolveCodexTurnAssistantCompletionIdleTimeoutMs(
-  value: number | undefined,
-): number {
-  return resolvePositiveIntegerTimeoutMs(value, CODEX_TURN_ASSISTANT_COMPLETION_IDLE_TIMEOUT_MS);
-}
-
-export function resolveCodexPostToolRawAssistantCompletionIdleTimeoutMs(
-  value: number | undefined,
-  fallbackMs: number,
-): number {
-  const defaultMs = Math.max(
-    resolvePositiveIntegerTimeoutMs(undefined, fallbackMs),
-    CODEX_POST_TOOL_RAW_ASSISTANT_COMPLETION_IDLE_TIMEOUT_MS,
-  );
-  return resolvePositiveIntegerTimeoutMs(value, defaultMs);
-}
-
-export function resolveCodexTurnTerminalIdleTimeoutMs(value: number | undefined): number {
-  return resolvePositiveIntegerTimeoutMs(value, CODEX_TURN_TERMINAL_IDLE_TIMEOUT_MS);
+  const turnTimeoutMs = resolveTimerTimeoutMs(params.timeoutMs, timeoutFloorMs);
+  const requestBudgetMs =
+    params.requestTimeoutMs === undefined
+      ? turnTimeoutMs
+      : resolveTimerTimeoutMs(
+          params.requestTimeoutMs * CODEX_APP_SERVER_STARTUP_REQUEST_TIMEOUT_MULTIPLE,
+          turnTimeoutMs,
+        );
+  return Math.max(timeoutFloorMs, Math.min(turnTimeoutMs, requestBudgetMs));
 }
 
 export function resolveCodexGatewayTimeoutWithGraceMs(timeoutMs: number, graceMs = 10_000): number {
-  const timeout = resolvePositiveIntegerTimeoutMs(timeoutMs, 1);
+  const timeout = resolveTimerTimeoutMs(timeoutMs, 1);
   const grace = resolveTimerTimeoutMs(graceMs, 0, 0);
   return addTimerTimeoutGraceMs(timeout, grace) ?? timeout;
 }

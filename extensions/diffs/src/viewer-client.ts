@@ -1,13 +1,11 @@
 import { FileDiff, preloadHighlighter } from "@pierre/diffs";
-import type {
-  FileContents,
-  FileDiffMetadata,
-  FileDiffOptions,
-  SupportedLanguages,
-} from "@pierre/diffs";
+import type { FileDiffOptions, SupportedLanguages } from "@pierre/diffs";
 import { normalizeDiffViewerPayloadLanguages } from "./language-hints.js";
 import type { DiffViewerPayload, DiffLayout, DiffTheme } from "./types.js";
 import { parseViewerPayloadJson } from "./viewer-payload.js";
+
+// oxlint-disable-next-line eslint/no-underscore-dangle -- Bundled builds replace this compile-time define identifier.
+declare const __OPENCLAW_DIFFS_LANGUAGE_PACK__: boolean | undefined;
 
 type ViewerState = {
   theme: DiffTheme;
@@ -21,7 +19,7 @@ type DiffController = {
   diff: FileDiff;
 };
 
-export const controllers: DiffController[] = [];
+const controllers: DiffController[] = [];
 
 const viewerState: ViewerState = {
   theme: "dark",
@@ -54,35 +52,6 @@ function getCards(): Array<{ host: HTMLElement; payload: DiffViewerPayload }> {
     }
   }
   return cards;
-}
-
-function ensureShadowRoot(host: HTMLElement): void {
-  if (host.shadowRoot) {
-    return;
-  }
-  const template = host.querySelector<HTMLTemplateElement>(
-    ":scope > template[shadowrootmode='open']",
-  );
-  if (!template) {
-    return;
-  }
-  const shadowRoot = host.attachShadow({ mode: "open" });
-  shadowRoot.append(template.content.cloneNode(true));
-  template.remove();
-}
-
-function getHydrateProps(payload: DiffViewerPayload): {
-  fileDiff?: FileDiffMetadata;
-  oldFile?: FileContents;
-  newFile?: FileContents;
-} {
-  if (payload.fileDiff) {
-    return { fileDiff: payload.fileDiff };
-  }
-  return {
-    oldFile: payload.oldFile,
-    newFile: payload.newFile,
-  };
 }
 
 type ToolbarIconName =
@@ -196,6 +165,10 @@ function applyToolbarButtonStyles(button: HTMLButtonElement, active: boolean): v
   icon.style.pointerEvents = "none";
 }
 
+function isImageRenderMode(): boolean {
+  return document.querySelector("main.oc-frame")?.getAttribute("data-render-mode") === "image";
+}
+
 function createToolbar(): HTMLElement {
   const toolbar = document.createElement("div");
   toolbar.className = "oc-diff-toolbar";
@@ -254,7 +227,7 @@ function createToolbar(): HTMLElement {
   return toolbar;
 }
 
-function createRenderOptions(payload: DiffViewerPayload): FileDiffOptions<undefined> {
+function createRenderOptions(payload: DiffViewerPayload): FileDiffOptions<undefined, undefined> {
   return {
     theme: payload.options.theme,
     themeType: viewerState.theme,
@@ -265,7 +238,10 @@ function createRenderOptions(payload: DiffViewerPayload): FileDiffOptions<undefi
     disableLineNumbers: payload.options.disableLineNumbers,
     disableBackground: !viewerState.backgroundEnabled,
     unsafeCSS: payload.options.unsafeCSS,
-    renderHeaderMetadata: () => createToolbar(),
+    // Image/PDF exports are static; the interactive toggle toolbar would
+    // render as dead UI in the captured file. Returning null keeps the
+    // library's built-in +N/-N header counts without the buttons.
+    renderHeaderMetadata: () => (isImageRenderMode() ? null : createToolbar()),
   };
 }
 
@@ -286,10 +262,12 @@ function syncAllControllers(): void {
 }
 
 export async function hydrateViewer(): Promise<void> {
+  const languagePackAvailable =
+    typeof __OPENCLAW_DIFFS_LANGUAGE_PACK__ === "boolean" && __OPENCLAW_DIFFS_LANGUAGE_PACK__;
   const cards = await Promise.all(
     getCards().map(async ({ host, payload }) => ({
       host,
-      payload: await normalizeDiffViewerPayloadLanguages(payload),
+      payload: await normalizeDiffViewerPayloadLanguages(payload, { languagePackAvailable }),
     })),
   );
   const langs = new Set<SupportedLanguages>();
@@ -316,20 +294,20 @@ export async function hydrateViewer(): Promise<void> {
   syncDocumentTheme();
 
   for (const { host, payload } of cards) {
-    try {
-      ensureShadowRoot(host);
-      const diff = new FileDiff(createRenderOptions(payload));
-      diff.hydrate({
-        fileContainer: host,
-        prerenderedHTML: payload.prerenderedHTML,
-        ...getHydrateProps(payload),
-      });
-      const controller = { payload, diff };
-      applyState(controller);
-      controllers.push(controller);
-    } catch (error) {
-      console.warn("Skipping diff card that failed to hydrate", error);
-    }
+    const diff = new FileDiff(createRenderOptions(payload));
+    const hydration = {
+      fileContainer: host,
+      prerenderedHTML: payload.prerenderedHTML,
+      fileDiff: payload.fileDiff,
+    };
+    diff.hydrate(
+      payload.oldFile && payload.newFile
+        ? { ...hydration, oldFile: payload.oldFile, newFile: payload.newFile }
+        : hydration,
+    );
+    const controller = { payload, diff };
+    applyState(controller);
+    controllers.push(controller);
   }
 }
 
@@ -343,7 +321,7 @@ async function main(): Promise<void> {
   }
 }
 
-export const disableAutoStartKey = Symbol.for("openclaw.diffs.disableAutoStart");
+const disableAutoStartKey = Symbol.for("openclaw.diffs.disableAutoStart");
 
 const autoStartDisabled = Boolean(
   (globalThis as typeof globalThis & Record<symbol, unknown>)[disableAutoStartKey],

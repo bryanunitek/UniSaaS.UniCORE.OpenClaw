@@ -1,6 +1,3 @@
-import { open } from "node:fs/promises";
-
-const IMAGE_TYPE_SNIFF_BYTES = 4100;
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
 export function detectSupportedImageMimeType(buffer: Uint8Array): string | null {
@@ -16,26 +13,16 @@ export function detectSupportedImageMimeType(buffer: Uint8Array): string | null 
   if (startsWithAscii(buffer, 0, "RIFF") && startsWithAscii(buffer, 8, "WEBP")) {
     return "image/webp";
   }
-  return null;
-}
-
-export async function detectSupportedImageMimeTypeFromFile(
-  filePath: string,
-): Promise<string | null> {
-  const fileHandle = await open(filePath, "r");
-  try {
-    const buffer = Buffer.alloc(IMAGE_TYPE_SNIFF_BYTES);
-    const { bytesRead } = await fileHandle.read(buffer, 0, IMAGE_TYPE_SNIFF_BYTES, 0);
-    return detectSupportedImageMimeType(buffer.subarray(0, bytesRead));
-  } finally {
-    await fileHandle.close();
+  if (startsWithAscii(buffer, 0, "BM") && isBmp(buffer)) {
+    return "image/bmp";
   }
+  return null;
 }
 
 function isPng(buffer: Uint8Array): boolean {
   return (
     buffer.length >= 16 &&
-    readUint32BE(buffer, PNG_SIGNATURE.length) === 13 &&
+    readUint32(buffer, PNG_SIGNATURE.length, "big") === 13 &&
     startsWithAscii(buffer, 12, "IHDR")
   );
 }
@@ -43,7 +30,7 @@ function isPng(buffer: Uint8Array): boolean {
 function isAnimatedPng(buffer: Uint8Array): boolean {
   let offset = PNG_SIGNATURE.length;
   while (offset + 8 <= buffer.length) {
-    const chunkLength = readUint32BE(buffer, offset);
+    const chunkLength = readUint32(buffer, offset, "big");
     const chunkTypeOffset = offset + 4;
     if (startsWithAscii(buffer, chunkTypeOffset, "acTL")) {
       return true;
@@ -52,6 +39,7 @@ function isAnimatedPng(buffer: Uint8Array): boolean {
       return false;
     }
 
+    // PNG chunk length is untrusted input; bail if advancing would wrap or exceed the sniffed bytes.
     const nextOffset = offset + 8 + chunkLength + 4;
     if (nextOffset <= offset || nextOffset > buffer.length) {
       return false;
@@ -61,13 +49,51 @@ function isAnimatedPng(buffer: Uint8Array): boolean {
   return false;
 }
 
-function readUint32BE(buffer: Uint8Array, offset: number): number {
-  return (
-    (buffer[offset] ?? 0) * 0x1000000 +
-    ((buffer[offset + 1] ?? 0) << 16) +
-    ((buffer[offset + 2] ?? 0) << 8) +
-    (buffer[offset + 3] ?? 0)
-  );
+function isBmp(buffer: Uint8Array): boolean {
+  if (buffer.length < 26) {
+    return false;
+  }
+  const declaredFileSize = readUint32(buffer, 2, "little");
+  const pixelDataOffset = readUint32(buffer, 10, "little");
+  const dibHeaderSize = readUint32(buffer, 14, "little");
+  if (declaredFileSize !== 0 && declaredFileSize < 26) {
+    return false;
+  }
+  if (pixelDataOffset < 14 + dibHeaderSize) {
+    return false;
+  }
+  if (declaredFileSize !== 0 && pixelDataOffset >= declaredFileSize) {
+    return false;
+  }
+
+  let colorPlanes: number;
+  let bitsPerPixel: number;
+  if (dibHeaderSize === 12) {
+    colorPlanes = readUint16LE(buffer, 22);
+    bitsPerPixel = readUint16LE(buffer, 24);
+  } else if (dibHeaderSize >= 40 && dibHeaderSize <= 124) {
+    if (buffer.length < 30) {
+      return false;
+    }
+    colorPlanes = readUint16LE(buffer, 26);
+    bitsPerPixel = readUint16LE(buffer, 28);
+  } else {
+    return false;
+  }
+  return colorPlanes === 1 && [1, 4, 8, 16, 24, 32].includes(bitsPerPixel);
+}
+
+function readUint16LE(buffer: Uint8Array, offset: number): number {
+  return (buffer[offset] ?? 0) + ((buffer[offset + 1] ?? 0) << 8);
+}
+
+function readUint32(buffer: Uint8Array, offset: number, byteOrder: "big" | "little"): number {
+  let value = 0;
+  for (let index = 0; index < 4; index++) {
+    const shift = (byteOrder === "little" ? index : 3 - index) * 8;
+    value += (buffer[offset + index] ?? 0) * 2 ** shift;
+  }
+  return value;
 }
 
 function startsWith(buffer: Uint8Array, bytes: number[]): boolean {

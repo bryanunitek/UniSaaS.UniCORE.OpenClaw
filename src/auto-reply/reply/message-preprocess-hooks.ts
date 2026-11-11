@@ -1,3 +1,4 @@
+// Runs plugin message preprocessing hooks before reply prompt construction.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { fireAndForgetHook } from "../../hooks/fire-and-forget.js";
@@ -23,29 +24,18 @@ export function emitPreAgentMessageHooks(params: {
   }
 
   const canonical = deriveInboundMessageHookContext(params.ctx);
-  if (canonical.transcript) {
+  for (const [action, mapContext] of [
+    ["transcribed", toInternalMessageTranscribedContext],
+    ["preprocessed", toInternalMessagePreprocessedContext],
+  ] as const) {
+    if (action === "transcribed" && !canonical.transcript) {
+      continue;
+    }
     fireAndForgetHook(
       triggerInternalHook(
-        createInternalHookEvent(
-          "message",
-          "transcribed",
-          sessionKey,
-          toInternalMessageTranscribedContext(canonical, params.cfg),
-        ),
+        createInternalHookEvent("message", action, sessionKey, mapContext(canonical, params.cfg)),
       ),
-      "get-reply: message:transcribed internal hook failed",
+      `get-reply: message:${action} internal hook failed`,
     );
   }
-
-  fireAndForgetHook(
-    triggerInternalHook(
-      createInternalHookEvent(
-        "message",
-        "preprocessed",
-        sessionKey,
-        toInternalMessagePreprocessedContext(canonical, params.cfg),
-      ),
-    ),
-    "get-reply: message:preprocessed internal hook failed",
-  );
 }

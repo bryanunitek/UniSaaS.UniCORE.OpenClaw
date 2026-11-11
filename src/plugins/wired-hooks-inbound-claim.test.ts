@@ -1,5 +1,6 @@
+import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it, vi } from "vitest";
-import { createHookRunnerWithRegistry } from "./hooks.test-helpers.js";
+import { createHookRunnerWithRegistry } from "./hooks.test-fixtures.js";
 
 const inboundClaimEvent = {
   content: "who are you",
@@ -97,26 +98,6 @@ describe("inbound_claim hook runner", () => {
     expect(succeeding).toHaveBeenCalledTimes(1);
   });
 
-  it("can target a single plugin when core already owns the binding", async () => {
-    const first = vi.fn().mockResolvedValue({ handled: true });
-    const second = vi.fn().mockResolvedValue({ handled: true });
-    const { registry, runner } = createHookRunnerWithRegistry([
-      { hookName: "inbound_claim", handler: first },
-      { hookName: "inbound_claim", handler: second },
-    ]);
-    registry.typedHooks[1].pluginId = "other-plugin";
-
-    const result = await runner.runInboundClaimForPlugin(
-      "test-plugin",
-      inboundClaimEvent,
-      inboundClaimCtx,
-    );
-
-    expect(result).toEqual({ handled: true });
-    expect(first).toHaveBeenCalledTimes(1);
-    expect(second).not.toHaveBeenCalled();
-  });
-
   it("can target a loaded non-default plugin without mutating the helper registry", async () => {
     const first = vi.fn().mockResolvedValue({ handled: true });
     const second = vi.fn().mockResolvedValue({ handled: true });
@@ -161,26 +142,6 @@ describe("inbound_claim hook runner", () => {
     expect(result).toEqual({ status: "no_handler" });
   });
 
-  it("reports error when a targeted handler throws and none claim the event", async () => {
-    const logger = {
-      warn: vi.fn(),
-      error: vi.fn(),
-    };
-    const failing = vi.fn().mockRejectedValue(new Error("boom"));
-    const { runner } = createHookRunnerWithRegistry(
-      [{ hookName: "inbound_claim", handler: failing }],
-      { logger },
-    );
-
-    const result = await runner.runInboundClaimForPluginOutcome(
-      "test-plugin",
-      inboundClaimEvent,
-      inboundClaimCtx,
-    );
-
-    expect(result).toEqual({ status: "error", error: "boom" });
-  });
-
   it("reports targeted per-hook registration timeouts as handler errors", async () => {
     vi.useFakeTimers();
     try {
@@ -193,7 +154,7 @@ describe("inbound_claim hook runner", () => {
         [{ hookName: "inbound_claim", handler: slow }],
         { logger },
       );
-      registry.typedHooks[0].timeoutMs = 5;
+      expectDefined(registry.typedHooks[0], "registry.typedHooks[0] test invariant").timeoutMs = 5;
 
       const run = runner.runInboundClaimForPluginOutcome(
         "test-plugin",

@@ -7,7 +7,7 @@ const cleanupSignals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 
 type CleanupSignal = (typeof cleanupSignals)[number];
 
-export type E2eStateDir = {
+type E2eStateDir = {
   stateDir: string;
   created: boolean;
   cleanup: () => void;
@@ -24,8 +24,8 @@ export async function createE2eStateDir(prefix: string, env = process.env): Prom
 
   const cleanup = () => {
     if (created && !cleaned) {
-      cleaned = true;
       rmSync(stateDir, { force: true, recursive: true });
+      cleaned = true;
     }
   };
 

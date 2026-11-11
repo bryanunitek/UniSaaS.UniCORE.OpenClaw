@@ -1,4 +1,4 @@
-import { expectExplicitMusicGenerationCapabilities } from "openclaw/plugin-sdk/provider-test-contracts";
+// Fal tests cover music generation provider plugin behavior.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildFalMusicGenerationProvider } from "./music-generation-provider.js";
 
@@ -57,6 +57,13 @@ function streamedAudioResponse(bytes: string): Response {
   );
 }
 
+function falMusicJsonResponse(value: unknown) {
+  return {
+    response: Response.json(value),
+    release: vi.fn(async () => {}),
+  };
+}
+
 describe("fal music generation provider", () => {
   afterEach(() => {
     assertOkOrThrowHttpErrorMock.mockClear();
@@ -66,23 +73,16 @@ describe("fal music generation provider", () => {
     vi.unstubAllGlobals();
   });
 
-  it("declares explicit mode capabilities", () => {
-    expectExplicitMusicGenerationCapabilities(buildFalMusicGenerationProvider());
-  });
-
   it("submits MiniMax music through fal and downloads the generated track", async () => {
-    postJsonRequestMock.mockResolvedValue({
-      response: {
-        json: async () => ({
-          audio: {
-            url: "https://v3b.fal.media/files/b/kangaroo/out.mp3",
-            content_type: "audio/mpeg",
-            file_name: "out.mp3",
-          },
-        }),
-      },
-      release: vi.fn(async () => {}),
-    });
+    postJsonRequestMock.mockResolvedValue(
+      falMusicJsonResponse({
+        audio: {
+          url: "https://v3b.fal.media/files/b/kangaroo/out.mp3",
+          content_type: "audio/mpeg",
+          file_name: "out.mp3",
+        },
+      }),
+    );
     const fetchMock = vi.fn(
       async () =>
         new Response(Buffer.from("mp3-bytes"), {
@@ -124,17 +124,14 @@ describe("fal music generation provider", () => {
   });
 
   it("rejects generated music downloads that exceed the configured media cap", async () => {
-    postJsonRequestMock.mockResolvedValue({
-      response: {
-        json: async () => ({
-          audio: {
-            url: "https://v3b.fal.media/files/b/out.mp3",
-            content_type: "audio/mpeg",
-          },
-        }),
-      },
-      release: vi.fn(async () => {}),
-    });
+    postJsonRequestMock.mockResolvedValue(
+      falMusicJsonResponse({
+        audio: {
+          url: "https://v3b.fal.media/files/b/out.mp3",
+          content_type: "audio/mpeg",
+        },
+      }),
+    );
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => streamedAudioResponse("too-large")),
@@ -166,16 +163,13 @@ describe("fal music generation provider", () => {
   });
 
   it("maps ACE-Step duration and instrumental controls", async () => {
-    postJsonRequestMock.mockResolvedValue({
-      response: {
-        json: async () => ({
-          audio: { url: "https://example.com/out.wav", content_type: "audio/wav" },
-          seed: 42,
-          tags: "lofi, chill",
-        }),
-      },
-      release: vi.fn(async () => {}),
-    });
+    postJsonRequestMock.mockResolvedValue(
+      falMusicJsonResponse({
+        audio: { url: "https://example.com/out.wav", content_type: "audio/wav" },
+        seed: 42,
+        tags: "lofi, chill",
+      }),
+    );
     vi.stubGlobal(
       "fetch",
       vi.fn(
@@ -204,14 +198,11 @@ describe("fal music generation provider", () => {
   });
 
   it("maps Stable Audio duration controls", async () => {
-    postJsonRequestMock.mockResolvedValue({
-      response: {
-        json: async () => ({
-          audio: "https://example.com/stable.wav",
-        }),
-      },
-      release: vi.fn(async () => {}),
-    });
+    postJsonRequestMock.mockResolvedValue(
+      falMusicJsonResponse({
+        audio: "https://example.com/stable.wav",
+      }),
+    );
     vi.stubGlobal(
       "fetch",
       vi.fn(

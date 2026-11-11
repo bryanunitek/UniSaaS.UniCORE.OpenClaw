@@ -1,21 +1,23 @@
+import { asOptionalObjectRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   parseStandalonePlainTextToolCallBlocks as parseStandaloneRepairToolCallBlocks,
-  stripPlainTextToolCallBlocks as stripRepairToolCallBlocks,
+  type PlainTextToolCallBlock,
+  type PlainTextToolCallParseOptions,
+  type PlainTextToolCallProtectedRange,
 } from "../../packages/tool-call-repair/src/index.js";
 
-export type PlainTextToolCallBlock = {
-  arguments: Record<string, unknown>;
-  end: number;
-  name: string;
-  raw: string;
-  start: number;
+export type {
+  PlainTextToolCallBlock,
+  PlainTextToolCallParseOptions,
+  PlainTextToolCallProtectedRange,
+} from "../../packages/tool-call-repair/src/index.js";
+
+export type PlainTextToolCallStripOptions = {
+  /** Resolves literal source ranges that must not be interpreted as tool calls. */
+  resolveProtectedRanges?: (text: string) => readonly PlainTextToolCallProtectedRange[];
 };
 
-export type PlainTextToolCallParseOptions = {
-  allowedToolNames?: Iterable<string>;
-  maxPayloadBytes?: number;
-};
-
+/** Parses a message made only of standalone plain-text tool call blocks. */
 export function parseStandalonePlainTextToolCallBlocks(
   text: string,
   options?: PlainTextToolCallParseOptions,
@@ -23,27 +25,25 @@ export function parseStandalonePlainTextToolCallBlocks(
   return parseStandaloneRepairToolCallBlocks(text, options);
 }
 
-export function stripPlainTextToolCallBlocks(text: string): string {
-  return stripRepairToolCallBlocks(text);
-}
+/** Removes full-line standalone plain-text tool call blocks from visible text. */
+export { stripPlainTextToolCallBlocks } from "../../packages/tool-call-repair/src/index.js";
 
 type ToolPayloadTextBlock = {
   type: "text";
   text: string;
 };
 
+/** Minimal tool-result-like object shape accepted by payload extraction helpers. */
 export type ToolPayloadCarrier = {
+  /** Structured payload preferred over content text when present. */
   details?: unknown;
+  /** Provider/tool content blocks or fallback payload. */
   content?: unknown;
 };
 
 function isToolPayloadTextBlock(block: unknown): block is ToolPayloadTextBlock {
-  return (
-    Boolean(block) &&
-    typeof block === "object" &&
-    (block as { type?: unknown }).type === "text" &&
-    typeof (block as { text?: unknown }).text === "string"
-  );
+  const record = asOptionalObjectRecord(block);
+  return record?.type === "text" && typeof record.text === "string";
 }
 
 /**
@@ -54,6 +54,7 @@ export function extractToolPayload(result: ToolPayloadCarrier | null | undefined
   if (!result) {
     return undefined;
   }
+  // Structured details are authoritative; content text is only a compatibility fallback.
   if (result.details !== undefined) {
     return result.details;
   }

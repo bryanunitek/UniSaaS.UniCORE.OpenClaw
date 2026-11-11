@@ -14,10 +14,6 @@ type QaCronRunsPage = {
   entries?: QaCronRunLogEntry[];
 };
 
-export function resolveCronRunPollIntervalMs(intervalMs: number | undefined): number {
-  return resolveTimerTimeoutMs(intervalMs ?? 1_000, 1_000, 0);
-}
-
 export async function waitForCronRunCompletion(params: {
   callGateway: (
     method: string,
@@ -28,12 +24,22 @@ export async function waitForCronRunCompletion(params: {
   afterTs: number;
   timeoutMs?: number;
   intervalMs?: number;
+  gatewayCallTimeoutMs?: number;
 }) {
   const timeoutMs = params.timeoutMs ?? 90_000;
-  const intervalMs = resolveCronRunPollIntervalMs(params.intervalMs);
+  const intervalMs = resolveTimerTimeoutMs(params.intervalMs ?? 1_000, 1_000, 0);
+  const gatewayCallTimeoutMs = resolveTimerTimeoutMs(
+    params.gatewayCallTimeoutMs ?? 30_000,
+    30_000,
+    1,
+  );
   const startedAt = Date.now();
   let lastEntries: QaCronRunLogEntry[] = [];
   while (Date.now() - startedAt < timeoutMs) {
+    const remainingCallMs = timeoutMs - (Date.now() - startedAt);
+    if (remainingCallMs <= 0) {
+      break;
+    }
     const page = (await params.callGateway(
       "cron.runs",
       {
@@ -41,7 +47,7 @@ export async function waitForCronRunCompletion(params: {
         limit: 20,
         sortDir: "desc",
       },
-      { timeoutMs: Math.min(timeoutMs, 30_000) },
+      { timeoutMs: Math.min(remainingCallMs, gatewayCallTimeoutMs) },
     )) as QaCronRunsPage;
     const entries = Array.isArray(page.entries) ? page.entries : [];
     lastEntries = entries;

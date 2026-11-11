@@ -5,6 +5,6 @@ export function estimateBase64Size(bytes: number): number {
 }
 
 export function resolveVideoMaxBase64Bytes(maxBytes: number): number {
-  const expanded = Math.floor(maxBytes * (4 / 3));
+  const expanded = estimateBase64Size(maxBytes);
   return Math.min(expanded, DEFAULT_VIDEO_MAX_BASE64_BYTES);
 }

@@ -1,7 +1,8 @@
+import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { logVerbose } from "../globals.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
-import { resolveTimerTimeoutMs } from "../shared/number-coercion.js";
 
 const DEFAULT_MAX_CONCURRENT_FIRE_AND_FORGET_HOOKS = 16;
 const DEFAULT_MAX_QUEUED_FIRE_AND_FORGET_HOOKS = 256;
@@ -20,7 +21,7 @@ type FireAndForgetHookState = {
   queue: FireAndForgetHookJob[];
 };
 
-export type FireAndForgetBoundedHookOptions = {
+type FireAndForgetBoundedHookOptions = {
   maxConcurrency?: number;
   maxQueue?: number;
   timeoutMs?: number;
@@ -39,37 +40,13 @@ function positiveIntegerOrDefault(value: number | undefined, fallback: number): 
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
-function resolveFireAndForgetHookTimeoutMs(value: number | undefined): number {
-  if (typeof value === "number" && Number.isInteger(value) && value > 0) {
-    return resolveTimerTimeoutMs(value, DEFAULT_FIRE_AND_FORGET_HOOK_TIMEOUT_MS);
-  }
-  return resolveTimerTimeoutMs(DEFAULT_FIRE_AND_FORGET_HOOK_TIMEOUT_MS, 1);
-}
-
-function replaceLogControlCharacters(value: string): string {
-  let result = "";
-  for (const char of value) {
-    const codePoint = char.codePointAt(0);
-    if (
-      codePoint === undefined ||
-      codePoint <= 0x1f ||
-      codePoint === 0x7f ||
-      codePoint === 0x2028 ||
-      codePoint === 0x2029
-    ) {
-      result += " ";
-      continue;
-    }
-    result += char;
-  }
-  return result;
-}
-
+/** Format hook errors as bounded single-line log messages with secrets redacted upstream. */
 export function formatHookErrorForLog(err: unknown): string {
-  const formatted = replaceLogControlCharacters(formatErrorMessage(err))
+  const formatted = formatErrorMessage(err)
+    .replace(/\p{Cc}/gu, (char) => (char.charCodeAt(0) <= 0x7f ? " " : char))
     .replace(/\s+/g, " ")
     .trim();
-  return (formatted || "unknown error").slice(0, MAX_HOOK_LOG_MESSAGE_LENGTH);
+  return truncateUtf16Safe(formatted || "unknown error", MAX_HOOK_LOG_MESSAGE_LENGTH);
 }
 
 export function fireAndForgetHook(
@@ -84,48 +61,44 @@ export function fireAndForgetHook(
 
 function runFireAndForgetHookJob(
   state: FireAndForgetHookState,
-  job: FireAndForgetHookJob,
-  limits: { maxConcurrency: number },
+  { task, ...job }: FireAndForgetHookJob,
+  maxConcurrency: number,
 ): void {
+  // Pending observers need logging metadata, not the invoked factory's captured inputs.
   state.active += 1;
   let didLogTimeout = false;
-  const timeout =
-    job.timeoutMs > 0
-      ? setTimeout(() => {
-          didLogTimeout = true;
-          job.logger(`${job.label}: timed out after ${job.timeoutMs}ms`);
-        }, job.timeoutMs)
-      : undefined;
+  const timeout = setTimeout(() => {
+    // Timeout is informational only; the hook promise may still settle
+    // later, but the log should not double-report an eventual rejection.
+    didLogTimeout = true;
+    job.logger(`${job.label}: timed out after ${job.timeoutMs}ms`);
+  }, job.timeoutMs);
 
   void Promise.resolve()
-    .then(job.task)
+    .then(task)
     .catch((err: unknown) => {
       if (!didLogTimeout) {
         job.logger(`${job.label}: ${formatHookErrorForLog(err)}`);
       }
     })
     .finally(() => {
-      if (timeout) {
-        clearTimeout(timeout);
-      }
+      clearTimeout(timeout);
       state.active -= 1;
-      drainFireAndForgetHookQueue(state, limits);
+      drainFireAndForgetHookQueue(state, maxConcurrency);
     });
 }
 
-function drainFireAndForgetHookQueue(
-  state: FireAndForgetHookState,
-  limits: { maxConcurrency: number },
-): void {
-  while (state.active < limits.maxConcurrency) {
+function drainFireAndForgetHookQueue(state: FireAndForgetHookState, maxConcurrency: number): void {
+  while (state.active < maxConcurrency) {
     const next = state.queue.shift();
     if (!next) {
       return;
     }
-    runFireAndForgetHookJob(state, next, limits);
+    runFireAndForgetHookJob(state, next, maxConcurrency);
   }
 }
 
+/** Queue a fire-and-forget hook with bounded concurrency, queue depth, and timeout logs. */
 export function fireAndForgetBoundedHook(
   task: () => Promise<unknown>,
   label: string,
@@ -141,7 +114,10 @@ export function fireAndForgetBoundedHook(
     options.maxQueue,
     DEFAULT_MAX_QUEUED_FIRE_AND_FORGET_HOOKS,
   );
-  const timeoutMs = resolveFireAndForgetHookTimeoutMs(options.timeoutMs);
+  const timeoutMs = resolveTimerTimeoutMs(
+    positiveIntegerOrDefault(options.timeoutMs, DEFAULT_FIRE_AND_FORGET_HOOK_TIMEOUT_MS),
+    DEFAULT_FIRE_AND_FORGET_HOOK_TIMEOUT_MS,
+  );
 
   if (state.active >= maxConcurrency && state.queue.length >= maxQueue) {
     logger(`${label}: queue full; dropping hook`);
@@ -149,5 +125,5 @@ export function fireAndForgetBoundedHook(
   }
 
   state.queue.push({ task, label, logger, timeoutMs });
-  drainFireAndForgetHookQueue(state, { maxConcurrency });
+  drainFireAndForgetHookQueue(state, maxConcurrency);
 }

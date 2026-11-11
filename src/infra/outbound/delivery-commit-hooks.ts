@@ -1,3 +1,5 @@
+// Delivery commit hooks attach post-commit side effects to result objects
+// without widening the public outbound result shape.
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { formatErrorMessage } from "../errors.js";
 import type { OutboundDeliveryResult } from "./deliver-types.js";
@@ -16,12 +18,11 @@ export function attachOutboundDeliveryCommitHook<T extends OutboundDeliveryResul
   result: T,
   hook?: OutboundDeliveryCommitHook,
 ): T {
-  if (!hook) {
-    return result;
+  if (hook) {
+    const hooks = outboundDeliveryCommitHooks.get(result) ?? [];
+    hooks.push(hook);
+    outboundDeliveryCommitHooks.set(result, hooks);
   }
-  const hooks = outboundDeliveryCommitHooks.get(result) ?? [];
-  hooks.push(hook);
-  outboundDeliveryCommitHooks.set(result, hooks);
   return result;
 }
 

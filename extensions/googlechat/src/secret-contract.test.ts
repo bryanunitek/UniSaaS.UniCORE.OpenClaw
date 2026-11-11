@@ -1,3 +1,4 @@
+// Googlechat tests cover secret contract plugin behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   applyResolvedAssignments,
@@ -16,7 +17,7 @@ describe("googlechat secret contract", () => {
           accounts: {
             work: {
               enabled: true,
-              serviceAccountRef: {
+              serviceAccount: {
                 source: "env",
                 provider: "default",
                 id: "GOOGLECHAT_SERVICE_ACCOUNT",
@@ -40,6 +41,15 @@ describe("googlechat secret contract", () => {
       context,
     });
 
+    expect(context.assignments).toMatchObject([
+      {
+        ownerKind: "account",
+        ownerId: "googlechat:work",
+        requiredForGateway: false,
+        disposition: "isolate",
+      },
+    ]);
+
     const resolved = await resolveSecretRefValues(
       context.assignments.map((assignment) => assignment.ref),
       {
@@ -56,5 +66,34 @@ describe("googlechat secret contract", () => {
     const workAccount = resolvedConfig.channels?.googlechat?.accounts?.work;
     expect(workAccount?.serviceAccount).toBe('{"client_email":"bot@example.com"}');
     expect(context.warnings).toStrictEqual([]);
+  });
+  it("assigns root credentials to the implicit default and inherited accounts", () => {
+    const sourceConfig = {
+      channels: {
+        googlechat: {
+          serviceAccount: { source: "env", provider: "default", id: "ROOT" },
+          accounts: {
+            alpha: {},
+            beta: {},
+            override: { serviceAccount: { source: "env", provider: "default", id: "OVERRIDE" } },
+          },
+        },
+      },
+    } satisfies OpenClawConfig;
+    const context = createResolverContext({ sourceConfig, env: {} });
+    collectRuntimeConfigAssignments({
+      config: structuredClone(sourceConfig),
+      defaults: undefined,
+      context,
+    });
+    expect(context.assignments.map(({ ownerId, path }) => ({ ownerId, path }))).toEqual([
+      { ownerId: "googlechat:alpha", path: "channels.googlechat.serviceAccount" },
+      { ownerId: "googlechat:beta", path: "channels.googlechat.serviceAccount" },
+      { ownerId: "googlechat:default", path: "channels.googlechat.serviceAccount" },
+      {
+        ownerId: "googlechat:override",
+        path: "channels.googlechat.accounts.override.serviceAccount",
+      },
+    ]);
   });
 });

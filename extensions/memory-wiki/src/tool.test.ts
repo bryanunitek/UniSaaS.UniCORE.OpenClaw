@@ -1,10 +1,11 @@
+// Memory Wiki tests cover tool plugin behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import type { ResolvedMemoryWikiConfig } from "./config.js";
-import { createWikiApplyTool, createWikiLintTool } from "./tool.js";
 import { lintMemoryWikiVault } from "./lint.js";
+import { parseWikiMarkdown } from "./markdown.js";
 import { createMemoryWikiTestHarness } from "./test-helpers.js";
+import { createWikiApplyTool, createWikiLintTool } from "./tool.js";
 
 function asSchemaObject(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -16,29 +17,70 @@ function asSchemaObject(value: unknown): Record<string, unknown> {
 describe("memory-wiki tools", () => {
   const harness = createMemoryWikiTestHarness();
 
-  it("allows provenance metadata in wiki_apply claim evidence", () => {
-    const tool = createWikiApplyTool({} as ResolvedMemoryWikiConfig);
-    const applyProperties = asSchemaObject(asSchemaObject(tool.parameters).properties);
-    const claimsSchema = asSchemaObject(applyProperties.claims);
-    const claimSchema = asSchemaObject(claimsSchema.items);
-    const claimProperties = asSchemaObject(claimSchema.properties);
-    const evidenceSchema = asSchemaObject(claimProperties.evidence);
-    const evidenceArraySchema = asSchemaObject(evidenceSchema.items);
-    const evidenceProperties = asSchemaObject(evidenceArraySchema.properties);
+  it("rejects non-object wiki_apply arguments without throwing a TypeError", async () => {
+    const { config } = await harness.createVault({ initialize: true });
+    const tool = createWikiApplyTool(config);
 
-    expect(Object.keys(evidenceProperties).toSorted()).toEqual([
-      "confidence",
-      "kind",
-      "lines",
-      "note",
-      "path",
-      "privacyTier",
-      "sourceId",
-      "updatedAt",
-      "weight",
-    ]);
-    expect(evidenceProperties.confidence).toEqual({ type: "number", minimum: 0, maximum: 1 });
+    await expect(tool.execute("malformed-null", null)).rejects.toThrow(
+      'wiki mutation op must be one of "create_synthesis", "update_metadata"',
+    );
+    await expect(tool.execute("malformed-undefined", undefined)).rejects.toThrow(
+      'wiki mutation op must be one of "create_synthesis", "update_metadata"',
+    );
   });
+
+  async function createApplyFixture() {
+    const { rootDir, config } = await harness.createVault({ initialize: true });
+    const pagePath = path.join(rootDir, "entities", "alpha.md");
+    const original = [
+      "---",
+      "pageType: entity",
+      "id: entity.alpha",
+      "title: Alpha",
+      "status: active",
+      "updatedAt: 2026-01-01T00:00:00.000Z",
+      "---",
+      "",
+      "# Alpha",
+      "",
+      "Keep this human note.",
+      "",
+    ].join("\n");
+    await fs.writeFile(pagePath, original, "utf8");
+    return { tool: createWikiApplyTool(config), pagePath, original };
+  }
+
+  it.each(["update_metadata"])("applies supported metadata operation %s", async (op) => {
+    const { tool, pagePath } = await createApplyFixture();
+    const result = await tool.execute("valid-operation", {
+      op,
+      lookup: "entity.alpha",
+      status: "review",
+    });
+    const page = parseWikiMarkdown(await fs.readFile(pagePath, "utf8"));
+
+    expect(result.details).toMatchObject({ changed: true, operation: "update_metadata" });
+    expect(page.frontmatter.status).toBe("review");
+    expect(page.body).toContain("Keep this human note.");
+  });
+
+  it.each([999])(
+    "keeps wiki pages unchanged for out-of-range claim confidence %s",
+    async (confidence) => {
+      const { tool, pagePath, original } = await createApplyFixture();
+
+      await expect(
+        tool.execute("invalid-claim-confidence", {
+          op: "update_metadata",
+          lookup: "entity.alpha",
+          claims: [{ text: "Alpha fact", confidence }],
+        }),
+      ).rejects.toThrow(
+        `claims[0].confidence must be a number between 0 and 1; received ${confidence}.`,
+      );
+      await expect(fs.readFile(pagePath, "utf8")).resolves.toBe(original);
+    },
+  );
 
   it("returns tool-safe relative report paths from wiki_lint", async () => {
     const { rootDir, config } = await harness.createVault({ initialize: true });

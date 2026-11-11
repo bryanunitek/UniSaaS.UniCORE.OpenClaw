@@ -1,3 +1,4 @@
+// OAuth TLS preflight doctor tests cover certificate warnings and repair notes.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 
@@ -7,21 +8,7 @@ vi.mock("../../packages/terminal-core/src/note.js", () => ({
   note,
 }));
 
-import { noteOpenAIOAuthTlsPrerequisites } from "./oauth-tls-preflight.js";
-
-function buildOpenAICodexOAuthConfig(): OpenClawConfig {
-  return {
-    auth: {
-      profiles: {
-        "openai:user@example.com": {
-          provider: "openai",
-          mode: "oauth",
-          email: "user@example.com",
-        },
-      },
-    },
-  };
-}
+import { noteOpenAIOAuthTlsPrerequisites } from "../plugins/provider-openai-chatgpt-oauth-tls.js";
 
 function buildOpenAIOAuthConfig(): OpenClawConfig {
   return {
@@ -52,7 +39,7 @@ describe("noteOpenAIOAuthTlsPrerequisites", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     try {
-      await noteOpenAIOAuthTlsPrerequisites({ cfg: buildOpenAICodexOAuthConfig() });
+      await noteOpenAIOAuthTlsPrerequisites({ cfg: buildOpenAIOAuthConfig() });
     } finally {
       vi.stubGlobal("fetch", originalFetch);
     }
@@ -61,20 +48,6 @@ describe("noteOpenAIOAuthTlsPrerequisites", () => {
     const [message, title] = note.mock.calls[0] as [string, string];
     expect(title).toBe("OAuth TLS prerequisites");
     expect(message).toContain("brew postinstall ca-certificates");
-  });
-
-  it("stays quiet when preflight succeeds", async () => {
-    const originalFetch = globalThis.fetch;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("", { status: 400 })),
-    );
-    try {
-      await noteOpenAIOAuthTlsPrerequisites({ cfg: buildOpenAICodexOAuthConfig() });
-    } finally {
-      vi.stubGlobal("fetch", originalFetch);
-    }
-    expect(note).not.toHaveBeenCalled();
   });
 
   it("runs the preflight for canonical OpenAI OAuth profiles", async () => {

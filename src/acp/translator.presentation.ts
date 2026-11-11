@@ -1,14 +1,10 @@
-import type {
-  InitializeRequest,
-  SessionConfigOption,
-  SessionModeState,
-} from "@agentclientprotocol/sdk";
-import {
-  toAcpSessionLineageMeta,
-  type AcpSessionLineageMeta,
-} from "@openclaw/acp-core/session-lineage-meta";
+import type { SessionConfigOption, SessionModeState } from "@agentclientprotocol/sdk";
+import { toAcpSessionLineageMeta } from "@openclaw/acp-core/session-lineage-meta";
 import { timestampMsToIsoString } from "@openclaw/normalization-core/number-coercion";
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import {
+  normalizeFastMode,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
 import { BASE_THINKING_LEVELS } from "../auto-reply/thinking.shared.js";
 import type { GatewaySessionRow } from "../gateway/session-utils.js";
 
@@ -21,12 +17,6 @@ export const ACP_RESPONSE_USAGE_CONFIG_ID = "response_usage";
 export const ACP_ELEVATED_LEVEL_CONFIG_ID = "elevated_level";
 export const ACP_TIMEOUT_CONFIG_ID = "timeout";
 export const ACP_TIMEOUT_SECONDS_CONFIG_ID = "timeout_seconds";
-
-export type ClientCapabilityState = {
-  readTextFile: boolean;
-  writeTextFile: boolean;
-  terminal: boolean;
-};
 
 export type GatewaySessionPresentationRow = Pick<
   GatewaySessionRow,
@@ -46,6 +36,7 @@ export type GatewaySessionPresentationRow = Pick<
   | "updatedAt"
   | "thinkingLevel"
   | "fastMode"
+  | "effectiveFastMode"
   | "modelProvider"
   | "model"
   | "thinkingLevels"
@@ -59,62 +50,17 @@ export type GatewaySessionPresentationRow = Pick<
   | "contextTokens"
 >;
 
-export type SessionPresentation = {
-  configOptions: SessionConfigOption[];
-  modes: SessionModeState;
+export type SessionSnapshot = ReturnType<typeof buildSessionPresentation> & {
+  metadata?: ReturnType<typeof buildSessionMetadata>;
+  usage?: ReturnType<typeof buildSessionUsageSnapshot>;
 };
-
-export type SessionMetadata = {
-  title?: string | null;
-  updatedAt?: string | null;
-  _meta?: AcpSessionLineageMeta;
-};
-
-export type SessionUsageSnapshot = {
-  size: number;
-  used: number;
-};
-
-export type SessionSnapshot = SessionPresentation & {
-  metadata?: SessionMetadata;
-  usage?: SessionUsageSnapshot;
-};
-
-export function normalizeClientCapabilities(
-  capabilities: InitializeRequest["clientCapabilities"] | undefined,
-): ClientCapabilityState {
-  return {
-    readTextFile: capabilities?.fs?.readTextFile === true,
-    writeTextFile: capabilities?.fs?.writeTextFile === true,
-    terminal: capabilities?.terminal === true,
-  };
-}
-
-function formatThinkingLevelName(level: string): string {
-  switch (level) {
-    case "xhigh":
-      return "Extra High";
-    case "adaptive":
-      return "Adaptive";
-    default:
-      return level.length > 0 ? `${level[0].toUpperCase()}${level.slice(1)}` : "Unknown";
-  }
-}
-
-function buildThinkingModeDescription(level: string): string | undefined {
-  if (level === "adaptive") {
-    return "Use the Gateway session default thought level.";
-  }
-  return undefined;
-}
 
 function formatConfigValueName(value: string): string {
-  switch (value) {
-    case "xhigh":
-      return "Extra High";
-    default:
-      return value.length > 0 ? `${value[0].toUpperCase()}${value.slice(1)}` : "Unknown";
-  }
+  return value === "xhigh"
+    ? "Extra High"
+    : value.length > 0
+      ? `${value.charAt(0).toUpperCase()}${value.slice(1)}`
+      : "Unknown";
 }
 
 function buildSelectConfigOption(params: {
@@ -142,7 +88,7 @@ function buildSelectConfigOption(params: {
 export function buildSessionPresentation(params: {
   row?: GatewaySessionPresentationRow;
   overrides?: Partial<GatewaySessionPresentationRow>;
-}): SessionPresentation {
+}) {
   const row = {
     ...params.row,
     ...params.overrides,
@@ -151,6 +97,7 @@ export function buildSessionPresentation(params: {
     ...BASE_THINKING_LEVELS,
   ];
   const currentModeId = normalizeOptionalString(row.thinkingLevel) || "adaptive";
+  const currentFastMode = normalizeFastMode(row.effectiveFastMode ?? row.fastMode) ?? false;
   if (!availableLevelIds.includes(currentModeId)) {
     availableLevelIds.push(currentModeId);
   }
@@ -159,8 +106,9 @@ export function buildSessionPresentation(params: {
     currentModeId,
     availableModes: availableLevelIds.map((level) => ({
       id: level,
-      name: formatThinkingLevelName(level),
-      description: buildThinkingModeDescription(level),
+      name: formatConfigValueName(level),
+      description:
+        level === "adaptive" ? "Use the Gateway session default thought level." : undefined,
     })),
   };
 
@@ -178,8 +126,8 @@ export function buildSessionPresentation(params: {
       id: ACP_FAST_MODE_CONFIG_ID,
       name: "Fast mode",
       description: "Controls whether OpenAI sessions use the Gateway fast-mode profile.",
-      currentValue: row.fastMode ? "on" : "off",
-      values: ["off", "on"],
+      currentValue: currentFastMode === "auto" ? "auto" : currentFastMode ? "on" : "off",
+      values: ["off", "auto", "on"],
     }),
     buildSelectConfigOption({
       id: ACP_VERBOSE_LEVEL_CONFIG_ID,
@@ -207,9 +155,9 @@ export function buildSessionPresentation(params: {
       id: ACP_RESPONSE_USAGE_CONFIG_ID,
       name: "Usage detail",
       description:
-        "Controls how much usage information OpenClaw attaches to responses for the session.",
-      currentValue: normalizeOptionalString(row.responseUsage) || "off",
-      values: ["off", "tokens", "full"],
+        "Controls how much usage information OpenClaw attaches to responses for the session. 'inherit' follows the configured default; 'off' explicitly disables it for this session.",
+      currentValue: normalizeOptionalString(row.responseUsage) || "inherit",
+      values: ["inherit", "off", "tokens", "full"],
     }),
     buildSelectConfigOption({
       id: ACP_ELEVATED_LEVEL_CONFIG_ID,
@@ -226,7 +174,7 @@ export function buildSessionPresentation(params: {
 export function buildSessionMetadata(params: {
   row?: GatewaySessionPresentationRow;
   sessionKey: string;
-}): SessionMetadata {
+}) {
   const title =
     normalizeOptionalString(params.row?.derivedTitle) ||
     normalizeOptionalString(params.row?.displayName) ||
@@ -245,9 +193,7 @@ export function buildSessionMetadata(params: {
   };
 }
 
-export function buildSessionUsageSnapshot(
-  row?: GatewaySessionPresentationRow,
-): SessionUsageSnapshot | undefined {
+export function buildSessionUsageSnapshot(row?: GatewaySessionPresentationRow) {
   const totalTokens = row?.totalTokens;
   const contextTokens = row?.contextTokens;
   if (

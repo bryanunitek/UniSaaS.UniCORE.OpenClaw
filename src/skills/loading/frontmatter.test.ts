@@ -1,30 +1,27 @@
+// Frontmatter tests cover skill metadata parsing and validation.
 import { describe, expect, it } from "vitest";
 import {
-  parseFrontmatter,
-  resolveOpenClawMetadata,
+  parseSkillFrontmatter,
+  resolveSkillManifestMetadata,
   resolveSkillInvocationPolicy,
 } from "./frontmatter.js";
 
-describe("resolveSkillInvocationPolicy", () => {
-  it("defaults to enabled behaviors", () => {
-    const policy = resolveSkillInvocationPolicy({});
-    expect(policy.userInvocable).toBe(true);
-    expect(policy.disableModelInvocation).toBe(false);
-  });
-
-  it("parses frontmatter boolean strings", () => {
-    const policy = resolveSkillInvocationPolicy({
-      "user-invocable": "no",
-      "disable-model-invocation": "yes",
-    });
-    expect(policy.userInvocable).toBe(false);
-    expect(policy.disableModelInvocation).toBe(true);
+describe("parseSkillFrontmatter", () => {
+  it("rejects unresolved aliases under explicit YAML keys", () => {
+    expect(() =>
+      parseSkillFrontmatter(`---
+name: sample-skill
+description: Working skill
+? metadata
+: *missing
+---`),
+    ).toThrow(/invalid frontmatter.*YAML_EXCEPTION: Unresolved alias/);
   });
 });
 
-describe("resolveOpenClawMetadata install validation", () => {
+describe("resolveSkillManifestMetadata install validation", () => {
   function resolveInstall(frontmatter: Record<string, string>) {
-    return resolveOpenClawMetadata(frontmatter)?.install;
+    return resolveSkillManifestMetadata(frontmatter)?.install;
   }
 
   it("accepts safe install specs", () => {
@@ -69,8 +66,44 @@ describe("resolveOpenClawMetadata install validation", () => {
     expect(install).toBeUndefined();
   });
 
+  it("normalizes a download installer's optional SHA-256 digest", () => {
+    const sha256 = "a".repeat(64);
+    const install = resolveInstall({
+      metadata: JSON.stringify({
+        openclaw: {
+          install: [
+            {
+              kind: "download",
+              url: "https://example.com/runtime.tar.bz2",
+              sha256: ` ${sha256.toUpperCase()} `,
+            },
+          ],
+        },
+      }),
+    });
+
+    expect(install).toEqual([
+      { kind: "download", url: "https://example.com/runtime.tar.bz2", sha256 },
+    ]);
+  });
+
+  it.each(["g".repeat(64), 123])(
+    "drops a download installer declaring an invalid SHA-256 digest (%j)",
+    (sha256) => {
+      const install = resolveInstall({
+        metadata: JSON.stringify({
+          openclaw: {
+            install: [{ kind: "download", url: "https://example.com/runtime.tar.bz2", sha256 }],
+          },
+        }),
+      });
+
+      expect(install).toBeUndefined();
+    },
+  );
+
   it("parses Link-style YAML metadata with node install hints", () => {
-    const frontmatter = parseFrontmatter(`---
+    const frontmatter = parseSkillFrontmatter(`---
 name: create-payment-credential
 description: |
   Gets secure, one-time-use payment credentials from a Link wallet so agents can complete purchases.
@@ -95,7 +128,7 @@ user-invocable: true
 # Creating Payment Credentials
 `);
 
-    const metadata = resolveOpenClawMetadata(frontmatter);
+    const metadata = resolveSkillManifestMetadata(frontmatter);
 
     expect(frontmatter.name).toBe("create-payment-credential");
     expect(frontmatter.description).toContain("one-time-use payment credentials");

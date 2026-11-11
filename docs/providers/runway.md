@@ -7,13 +7,13 @@ read_when:
   - You want to make Runway the default video provider
 ---
 
-OpenClaw ships a bundled `runway` provider for hosted video generation. The plugin is enabled by default and registers the `runway` provider against the `videoGenerationProviders` contract.
+OpenClaw ships a bundled `runway` provider for hosted video generation, enabled by default, registered against the `videoGenerationProviders` contract.
 
 | Property        | Value                                                             |
 | --------------- | ----------------------------------------------------------------- |
 | Provider id     | `runway`                                                          |
 | Plugin          | bundled, `enabledByDefault: true`                                 |
-| Auth env vars   | `RUNWAYML_API_SECRET` (canonical) or `RUNWAY_API_KEY`             |
+| Auth env vars   | `RUNWAYML_API_SECRET` (preferred) or `RUNWAY_API_KEY`             |
 | Onboarding flag | `--auth-choice runway-api-key`                                    |
 | Direct CLI flag | `--runway-api-key <key>`                                          |
 | API             | Runway task-based video generation (`GET /v1/tasks/{id}` polling) |
@@ -29,7 +29,7 @@ OpenClaw ships a bundled `runway` provider for hosted video generation. The plug
   </Step>
   <Step title="Set Runway as the default video provider">
     ```bash
-    openclaw config set agents.defaults.videoGenerationModel.primary "runway/gen4.5"
+    openclaw config set agents.defaults.mediaModels.video.primary "runway/gen4.5"
     ```
   </Step>
   <Step title="Generate a video">
@@ -68,8 +68,10 @@ Local image and video references are supported via data URIs.
 {
   agents: {
     defaults: {
-      videoGenerationModel: {
-        primary: "runway/gen4.5",
+      mediaModels: {
+        video: {
+          primary: "runway/gen4.5",
+        },
       },
     },
   },
@@ -80,8 +82,8 @@ Local image and video references are supported via data URIs.
 
 <AccordionGroup>
   <Accordion title="Environment variable aliases">
-    OpenClaw recognizes both `RUNWAYML_API_SECRET` (canonical) and `RUNWAY_API_KEY`.
-    Either variable will authenticate the Runway provider.
+    OpenClaw recognizes both `RUNWAYML_API_SECRET` (preferred) and `RUNWAY_API_KEY`.
+    Either variable authenticates the Runway provider.
   </Accordion>
 
   <Accordion title="Task polling">
@@ -98,6 +100,6 @@ Local image and video references are supported via data URIs.
     Shared tool parameters, provider selection, and async behavior.
   </Card>
   <Card title="Configuration reference" href="/gateway/config-agents#agent-defaults" icon="gear">
-    Agent default settings including video generation model.
+    Agent default settings including `mediaModels.video`.
   </Card>
 </CardGroup>

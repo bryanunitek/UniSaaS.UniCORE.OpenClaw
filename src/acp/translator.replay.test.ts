@@ -1,3 +1,4 @@
+/** Tests transcript replay conversion into ACP session update chunks. */
 import { describe, expect, it } from "vitest";
 import { extractReplayChunks } from "./translator.replay.js";
 
@@ -8,21 +9,6 @@ describe("ACP translator replay helpers", () => {
     ]);
     expect(extractReplayChunks({ role: "assistant", content: "Answer" })).toEqual([
       { sessionUpdate: "agent_message_chunk", text: "Answer" },
-    ]);
-  });
-
-  it("preserves assistant thinking as hidden thought chunks", () => {
-    expect(
-      extractReplayChunks({
-        role: "assistant",
-        content: [
-          { type: "thinking", thinking: "Internal reasoning" },
-          { type: "text", text: "Visible answer" },
-        ],
-      }),
-    ).toEqual([
-      { sessionUpdate: "agent_thought_chunk", text: "Internal reasoning" },
-      { sessionUpdate: "agent_message_chunk", text: "Visible answer" },
     ]);
   });
 

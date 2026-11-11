@@ -1,4 +1,7 @@
-import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
+import {
+  asNonNegativeFiniteNumber,
+  MAX_DATE_TIMESTAMP_MS,
+} from "@openclaw/normalization-core/number-coercion";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { normalizeAccountId } from "../routing/session-key.js";
@@ -6,13 +9,9 @@ import {
   resolveThreadBindingLifecycle as resolveSharedThreadBindingLifecycle,
   type ThreadBindingLifecycleRecord,
 } from "../shared/thread-binding-lifecycle.js";
-import { getLoadedChannelPlugin } from "./plugins/index.js";
-import { resolveBundledChannelThreadBindingDefaultPlacement } from "./plugins/thread-binding-api.js";
+import { asBoolean } from "../utils/boolean.js";
 
-export {
-  resolveThreadBindingLifecycle,
-  type ThreadBindingLifecycleRecord,
-} from "../shared/thread-binding-lifecycle.js";
+export { supportsThreadBindingSpawn as supportsAutomaticThreadBindingSpawn } from "./conversation-resolution.js";
 
 const DEFAULT_THREAD_BINDING_IDLE_HOURS = 24;
 const DEFAULT_THREAD_BINDING_MAX_AGE_HOURS = 0;
@@ -22,8 +21,6 @@ type SessionThreadBindingsConfigShape = {
   idleHours?: unknown;
   maxAgeHours?: unknown;
   spawnSessions?: unknown;
-  spawnSubagentSessions?: unknown;
-  spawnAcpSessions?: unknown;
   defaultSpawnContext?: unknown;
 };
 
@@ -32,9 +29,9 @@ type ChannelThreadBindingsContainerShape = {
   accounts?: Record<string, { threadBindings?: SessionThreadBindingsConfigShape } | undefined>;
 };
 
-export type ThreadBindingSpawnKind = "subagent" | "acp";
+type ThreadBindingSpawnKind = "subagent" | "acp";
 
-export type ThreadBindingSpawnPolicy = {
+type ThreadBindingSpawnPolicy = {
   channel: string;
   accountId: string;
   enabled: boolean;
@@ -42,61 +39,10 @@ export type ThreadBindingSpawnPolicy = {
   defaultSpawnContext: ThreadBindingSpawnContext;
 };
 
-export type ThreadBindingSpawnContext = "isolated" | "fork";
-
-function normalizeChannelId(value: string | undefined | null): string {
-  return normalizeLowercaseStringOrEmpty(value);
-}
-
-export function supportsAutomaticThreadBindingSpawn(channel: string): boolean {
-  return resolveDefaultTopLevelPlacement(channel) === "child";
-}
-
-export function requiresNativeThreadContextForThreadHere(channel: string): boolean {
-  return resolveDefaultTopLevelPlacement(channel) === "child";
-}
-
-export function resolveThreadBindingPlacementForCurrentContext(params: {
-  channel: string;
-  threadId?: string;
-}): "current" | "child" {
-  if (resolveDefaultTopLevelPlacement(params.channel) !== "child") {
-    return "current";
-  }
-  return params.threadId ? "current" : "child";
-}
-
-function resolveDefaultTopLevelPlacement(channel: string): "current" | "child" {
-  const normalized = normalizeChannelId(channel);
-  if (!normalized) {
-    return "current";
-  }
-  return (
-    getLoadedChannelPlugin(normalized)?.conversationBindings?.defaultTopLevelPlacement ??
-    resolveBundledChannelThreadBindingDefaultPlacement(normalized) ??
-    "current"
-  );
-}
-
-function normalizeBoolean(value: unknown): boolean | undefined {
-  if (typeof value !== "boolean") {
-    return undefined;
-  }
-  return value;
-}
-
-function normalizeThreadBindingHours(raw: unknown): number | undefined {
-  if (typeof raw !== "number" || !Number.isFinite(raw)) {
-    return undefined;
-  }
-  if (raw < 0) {
-    return undefined;
-  }
-  return raw;
-}
+type ThreadBindingSpawnContext = "isolated" | "fork";
 
 function resolveThreadBindingHoursMs(raw: unknown, fallbackHours: number): number {
-  const hours = normalizeThreadBindingHours(raw) ?? fallbackHours;
+  const hours = asNonNegativeFiniteNumber(raw) ?? fallbackHours;
   const durationMs = Math.floor(hours * 60 * 60 * 1000);
   if (!Number.isFinite(durationMs) || durationMs < 0) {
     return 0;
@@ -104,24 +50,25 @@ function resolveThreadBindingHoursMs(raw: unknown, fallbackHours: number): numbe
   return Math.min(durationMs, MAX_DATE_TIMESTAMP_MS);
 }
 
+/** Resolves thread-binding idle timeout with channel/account override before session default. */
 export function resolveThreadBindingIdleTimeoutMs(params: {
   channelIdleHoursRaw: unknown;
   sessionIdleHoursRaw: unknown;
 }): number {
   return resolveThreadBindingHoursMs(
     params.channelIdleHoursRaw,
-    normalizeThreadBindingHours(params.sessionIdleHoursRaw) ?? DEFAULT_THREAD_BINDING_IDLE_HOURS,
+    asNonNegativeFiniteNumber(params.sessionIdleHoursRaw) ?? DEFAULT_THREAD_BINDING_IDLE_HOURS,
   );
 }
 
+/** Resolves thread-binding max age with channel/account override before session default. */
 export function resolveThreadBindingMaxAgeMs(params: {
   channelMaxAgeHoursRaw: unknown;
   sessionMaxAgeHoursRaw: unknown;
 }): number {
   return resolveThreadBindingHoursMs(
     params.channelMaxAgeHoursRaw,
-    normalizeThreadBindingHours(params.sessionMaxAgeHoursRaw) ??
-      DEFAULT_THREAD_BINDING_MAX_AGE_HOURS,
+    asNonNegativeFiniteNumber(params.sessionMaxAgeHoursRaw) ?? DEFAULT_THREAD_BINDING_MAX_AGE_HOURS,
   );
 }
 
@@ -137,65 +84,51 @@ export function resolveThreadBindingsEnabled(params: {
   channelEnabledRaw: unknown;
   sessionEnabledRaw: unknown;
 }): boolean {
-  return (
-    normalizeBoolean(params.channelEnabledRaw) ?? normalizeBoolean(params.sessionEnabledRaw) ?? true
-  );
+  return asBoolean(params.channelEnabledRaw) ?? asBoolean(params.sessionEnabledRaw) ?? true;
 }
 
 function resolveChannelThreadBindings(params: {
   cfg: OpenClawConfig;
   channel: string;
-  accountId: string;
+  accountId?: string;
 }): {
   root?: SessionThreadBindingsConfigShape;
   account?: SessionThreadBindingsConfigShape;
 } {
   const channels = params.cfg.channels as Record<string, unknown> | undefined;
-  const channelConfig = channels?.[params.channel] as
+  const channelConfig = channels?.[normalizeLowercaseStringOrEmpty(params.channel)] as
     | ChannelThreadBindingsContainerShape
     | undefined;
-  const accountConfig = channelConfig?.accounts?.[params.accountId];
+  const accountConfig = channelConfig?.accounts?.[normalizeAccountId(params.accountId)];
   return {
     root: channelConfig?.threadBindings,
     account: accountConfig?.threadBindings,
   };
 }
 
-function resolveSpawnFlagKey(
-  kind: ThreadBindingSpawnKind,
-): "spawnSubagentSessions" | "spawnAcpSessions" {
-  return kind === "subagent" ? "spawnSubagentSessions" : "spawnAcpSessions";
-}
-
 function normalizeSpawnContext(value: unknown): ThreadBindingSpawnContext | undefined {
   return value === "isolated" || value === "fork" ? value : undefined;
 }
 
+/** Resolves effective spawn policy from account, channel, then global thread-binding config. */
 export function resolveThreadBindingSpawnPolicy(params: {
   cfg: OpenClawConfig;
   channel: string;
   accountId?: string;
   kind: ThreadBindingSpawnKind;
 }): ThreadBindingSpawnPolicy {
-  const channel = normalizeChannelId(params.channel);
+  const channel = normalizeLowercaseStringOrEmpty(params.channel);
   const accountId = normalizeAccountId(params.accountId);
-  const { root, account } = resolveChannelThreadBindings({
-    cfg: params.cfg,
-    channel,
-    accountId,
-  });
+  const { root, account } = resolveChannelThreadBindings({ cfg: params.cfg, channel, accountId });
   const enabled =
-    normalizeBoolean(account?.enabled) ??
-    normalizeBoolean(root?.enabled) ??
-    normalizeBoolean(params.cfg.session?.threadBindings?.enabled) ??
+    asBoolean(account?.enabled) ??
+    asBoolean(root?.enabled) ??
+    asBoolean(params.cfg.session?.threadBindings?.enabled) ??
     true;
-  const spawnFlagKey = resolveSpawnFlagKey(params.kind);
   const spawnEnabledRaw =
-    normalizeBoolean(account?.[spawnFlagKey]) ??
-    normalizeBoolean(account?.spawnSessions) ??
-    normalizeBoolean(root?.[spawnFlagKey]) ??
-    normalizeBoolean(root?.spawnSessions) ??
-    normalizeBoolean(params.cfg.session?.threadBindings?.spawnSessions);
+    asBoolean(account?.spawnSessions) ??
+    asBoolean(root?.spawnSessions) ??
+    asBoolean(params.cfg.session?.threadBindings?.spawnSessions);
   const spawnEnabled = spawnEnabledRaw ?? true;
   const defaultSpawnContext =
     normalizeSpawnContext(account?.defaultSpawnContext) ??
@@ -216,7 +149,7 @@ export function resolveThreadBindingIdleTimeoutMsForChannel(params: {
   channel: string;
   accountId?: string;
 }): number {
-  const { root, account } = resolveThreadBindingChannelScope(params);
+  const { root, account } = resolveChannelThreadBindings(params);
   return resolveThreadBindingIdleTimeoutMs({
     channelIdleHoursRaw: account?.idleHours ?? root?.idleHours,
     sessionIdleHoursRaw: params.cfg.session?.threadBindings?.idleHours,
@@ -228,24 +161,10 @@ export function resolveThreadBindingMaxAgeMsForChannel(params: {
   channel: string;
   accountId?: string;
 }): number {
-  const { root, account } = resolveThreadBindingChannelScope(params);
+  const { root, account } = resolveChannelThreadBindings(params);
   return resolveThreadBindingMaxAgeMs({
     channelMaxAgeHoursRaw: account?.maxAgeHours ?? root?.maxAgeHours,
     sessionMaxAgeHoursRaw: params.cfg.session?.threadBindings?.maxAgeHours,
-  });
-}
-
-function resolveThreadBindingChannelScope(params: {
-  cfg: OpenClawConfig;
-  channel: string;
-  accountId?: string;
-}) {
-  const channel = normalizeChannelId(params.channel);
-  const accountId = normalizeAccountId(params.accountId);
-  return resolveChannelThreadBindings({
-    cfg: params.cfg,
-    channel,
-    accountId,
   });
 }
 

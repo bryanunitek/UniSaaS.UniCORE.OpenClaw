@@ -1,9 +1,11 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
-import { readPositiveIntEnv } from "../env-limits.mjs";
+import { readPositiveIntEnv, readTcpPortEnv } from "../env-limits.mjs";
+import { readBoundedRequestBody } from "../request-body.mjs";
 
-const port = readPositiveIntEnv("CLICKCLACK_FIXTURE_PORT", 44181);
+const port = readTcpPortEnv("CLICKCLACK_FIXTURE_PORT", 44181);
+const requestMaxBytes = readPositiveIntEnv("CLICKCLACK_FIXTURE_REQUEST_MAX_BYTES", 4 * 1024 * 1024);
 const token = process.env.CLICKCLACK_FIXTURE_TOKEN ?? "clickclack-release-token";
 const statePath = process.env.CLICKCLACK_FIXTURE_STATE ?? "/tmp/openclaw-clickclack-fixture.json";
 const workspace = {
@@ -42,6 +44,7 @@ const messages = [];
 const threadReplies = [];
 const outboundMessages = [];
 const sockets = new Set();
+let socketGeneration = 0;
 
 function persist() {
   fs.writeFileSync(
@@ -52,6 +55,7 @@ function persist() {
         threadReplies,
         outboundMessages,
         socketCount: sockets.size,
+        socketGeneration,
       },
       null,
       2,
@@ -68,37 +72,40 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-function unauthorized(res) {
-  json(res, 401, { error: "unauthorized" });
-}
-
 function checkAuth(req, res) {
   if (req.url?.startsWith("/fixture/") || req.url === "/health") {
     return true;
   }
   if (req.headers.authorization !== `Bearer ${token}`) {
-    unauthorized(res);
+    json(res, 401, { error: "unauthorized" });
     return false;
   }
   return true;
 }
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.setEncoding("utf8");
-    req.on("data", (chunk) => {
-      body += chunk;
-    });
-    req.on("end", () => {
-      try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch {
-        resolve({});
-      }
-    });
-    req.on("error", reject);
-  });
+async function readBody(req) {
+  const body = await readBoundedRequestBody(req, requestMaxBytes, (limit) =>
+    Object.assign(new Error(`ClickClack fixture request body exceeded ${limit} bytes`), {
+      code: "ETOOBIG",
+    }),
+  );
+  try {
+    return body ? JSON.parse(body) : {};
+  } catch {
+    return {};
+  }
+}
+
+function handleRequestError(res, error) {
+  if (res.headersSent) {
+    res.destroy();
+    return;
+  }
+  if (error instanceof Error && error.code === "ETOOBIG") {
+    json(res, 413, { error: error.message });
+    return;
+  }
+  json(res, 500, { error: String(error instanceof Error ? error.message : error) });
 }
 
 function createMessage({ body, author = humanUser, parentMessageId }) {
@@ -171,8 +178,8 @@ function broadcast(event) {
   }
 }
 
-const server = http.createServer((req, res) => {
-  void (async () => {
+async function handleRequest(req, res) {
+  try {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     if (!checkAuth(req, res)) {
       return;
@@ -196,7 +203,7 @@ const server = http.createServer((req, res) => {
     if (req.method === "GET" && url.pathname === `/api/channels/${channel.id}/messages`) {
       const afterSeq = Number(url.searchParams.get("after_seq") ?? 0);
       json(res, 200, {
-        messages: messages.filter((message) => (message.channel_seq ?? 0) > afterSeq),
+        messages: messages.filter((message) => message.channel_seq > afterSeq),
       });
       return;
     }
@@ -240,11 +247,23 @@ const server = http.createServer((req, res) => {
       return;
     }
     if (req.method === "GET" && url.pathname === "/fixture/state") {
-      json(res, 200, { messages, threadReplies, outboundMessages, socketCount: sockets.size });
+      json(res, 200, {
+        messages,
+        threadReplies,
+        outboundMessages,
+        socketCount: sockets.size,
+        socketGeneration,
+      });
       return;
     }
     json(res, 404, { error: `unhandled ${req.method} ${url.pathname}` });
-  })();
+  } catch (error) {
+    handleRequestError(res, error);
+  }
+}
+
+const server = http.createServer((req, res) => {
+  void handleRequest(req, res);
 });
 
 server.on("upgrade", (req, socket) => {
@@ -273,15 +292,20 @@ server.on("upgrade", (req, socket) => {
     ].join("\r\n"),
   );
   sockets.add(socket);
+  socketGeneration += 1;
   persist();
-  socket.on("close", () => {
-    sockets.delete(socket);
-    persist();
+  const cleanupSocket = () => {
+    if (sockets.delete(socket)) {
+      persist();
+    }
+  };
+  socket.on("close", cleanupSocket);
+  socket.on("end", () => {
+    cleanupSocket();
+    socket.end();
   });
-  socket.on("error", () => {
-    sockets.delete(socket);
-    persist();
-  });
+  socket.on("error", cleanupSocket);
+  socket.resume();
 });
 
 persist();

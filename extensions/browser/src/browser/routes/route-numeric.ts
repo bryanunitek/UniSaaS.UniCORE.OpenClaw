@@ -6,18 +6,32 @@ import {
 } from "openclaw/plugin-sdk/number-runtime";
 import { normalizeBrowserTimerDelayMs } from "../timer-delay.js";
 
-function hasRouteInputValue(value: unknown): boolean {
-  return value != null;
+function routeNumberReader(parse: (value: unknown) => number | undefined, description: string) {
+  return (
+    value: unknown,
+    fieldName: string,
+    options?: { invalidMessage?: string },
+  ): number | undefined => {
+    const parsed = parse(value);
+    if (parsed === undefined && value != null) {
+      throw new Error(options?.invalidMessage ?? `${fieldName} must be ${description}.`);
+    }
+    return parsed;
+  };
 }
 
-export function readRouteFiniteNumber(value: unknown, fieldName: string): number | undefined {
-  const parsed = parseStrictFiniteNumber(value);
-  if (parsed === undefined && hasRouteInputValue(value)) {
-    throw new Error(`${fieldName} must be a finite number.`);
-  }
-  return parsed;
-}
+export const readRouteFiniteNumber = routeNumberReader(parseStrictFiniteNumber, "a finite number");
+export const readRouteInteger = routeNumberReader(parseStrictInteger, "an integer");
+export const readRoutePositiveInteger = routeNumberReader(
+  parseStrictPositiveInteger,
+  "a positive integer",
+);
+export const readRouteNonNegativeInteger = routeNumberReader(
+  parseStrictNonNegativeInteger,
+  "a non-negative integer",
+);
 
+/** Read an optional finite number, treating blank strings as absent. */
 export function readOptionalRouteFiniteNumber(
   value: unknown,
   fieldName: string,
@@ -28,30 +42,7 @@ export function readOptionalRouteFiniteNumber(
   return readRouteFiniteNumber(value, fieldName);
 }
 
-export function readRouteInteger(
-  value: unknown,
-  fieldName: string,
-  options?: { invalidMessage?: string },
-): number | undefined {
-  const parsed = parseStrictInteger(value);
-  if (parsed === undefined && hasRouteInputValue(value)) {
-    throw new Error(options?.invalidMessage ?? `${fieldName} must be an integer.`);
-  }
-  return parsed;
-}
-
-export function readRoutePositiveInteger(
-  value: unknown,
-  fieldName: string,
-  options?: { invalidMessage?: string },
-): number | undefined {
-  const parsed = parseStrictPositiveInteger(value);
-  if (parsed === undefined && hasRouteInputValue(value)) {
-    throw new Error(options?.invalidMessage ?? `${fieldName} must be a positive integer.`);
-  }
-  return parsed;
-}
-
+/** Read and normalize an optional positive timeout value. */
 export function readRouteTimerTimeoutMs(
   value: unknown,
   fieldName = "timeoutMs",
@@ -59,16 +50,4 @@ export function readRouteTimerTimeoutMs(
 ): number | undefined {
   const parsed = readRoutePositiveInteger(value, fieldName, opts);
   return parsed === undefined ? undefined : normalizeBrowserTimerDelayMs(parsed, opts);
-}
-
-export function readRouteNonNegativeInteger(
-  value: unknown,
-  fieldName: string,
-  options?: { invalidMessage?: string },
-): number | undefined {
-  const parsed = parseStrictNonNegativeInteger(value);
-  if (parsed === undefined && hasRouteInputValue(value)) {
-    throw new Error(options?.invalidMessage ?? `${fieldName} must be a non-negative integer.`);
-  }
-  return parsed;
 }

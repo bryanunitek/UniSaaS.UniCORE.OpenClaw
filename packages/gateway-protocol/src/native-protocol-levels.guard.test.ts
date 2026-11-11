@@ -1,46 +1,36 @@
+// Gateway Protocol tests cover native protocol levels.guard behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { describe, it } from "vitest";
-import { MIN_CLIENT_PROTOCOL_VERSION, PROTOCOL_VERSION } from "./version.js";
+import { beforeAll, describe, expect, it } from "vitest";
+import {
+  nativeProtocolOutputDirectories,
+  prepareNativeProtocol,
+} from "../../../scripts/prepare-native-protocol.mjs";
+import { ProtocolSchemas } from "./schema/protocol-schemas.js";
+import {
+  MIN_CLIENT_PROTOCOL_VERSION,
+  MIN_NODE_PROTOCOL_VERSION,
+  MIN_PROBE_PROTOCOL_VERSION,
+  PROTOCOL_VERSION,
+} from "./version.js";
 
-type ProtocolLevels = {
-  min: number;
-  max: number;
-};
+/**
+ * Cross-language guard for Gateway protocol version constants.
+ *
+ * Native Swift/Kotlin clients and dev smoke scripts cannot derive these values
+ * from TypeScript at runtime, so this test keeps generated constants
+ * and connect payloads aligned with the package source of truth.
+ */
 
-const expectedLevels: ProtocolLevels = {
-  min: MIN_CLIENT_PROTOCOL_VERSION,
-  max: PROTOCOL_VERSION,
-};
+const swiftGeneratedPath = `${nativeProtocolOutputDirectories.swift}/GatewayModels.swift`;
+beforeAll(() => prepareNativeProtocol());
 
+/** Reads a repo-relative source file used by a native protocol guard. */
 async function readRepoFile(relativePath: string): Promise<string> {
   return fs.readFile(path.join(process.cwd(), relativePath), "utf8");
 }
 
-function extractInteger(
-  content: string,
-  pattern: RegExp,
-  relativePath: string,
-  label: string,
-): number {
-  const match = pattern.exec(content);
-  if (!match) {
-    throw new Error(
-      `${relativePath}: missing ${label}; keep native Gateway protocol levels in sync with packages/gateway-protocol/src/version.ts.`,
-    );
-  }
-  return Number.parseInt(match[1], 10);
-}
-
-function assertLevelsMatch(relativePath: string, actual: ProtocolLevels): void {
-  if (actual.min === expectedLevels.min && actual.max === expectedLevels.max) {
-    return;
-  }
-  throw new Error(
-    `${relativePath}: Gateway protocol level mismatch: expected min=${expectedLevels.min} max=${expectedLevels.max} from packages/gateway-protocol/src/version.ts, got min=${actual.min} max=${actual.max}. Update the native constants/generated artifacts before shipping.`,
-  );
-}
-
+/** Asserts a compatibility pattern exists in generated/native source text. */
 function assertPattern(
   content: string,
   relativePath: string,
@@ -53,70 +43,155 @@ function assertPattern(
   throw new Error(`${relativePath}: ${message}`);
 }
 
-describe("native Gateway protocol levels", () => {
-  it("match the TypeScript source of truth", async () => {
-    if (MIN_CLIENT_PROTOCOL_VERSION > PROTOCOL_VERSION) {
-      throw new Error(
-        `packages/gateway-protocol/src/version.ts: MIN_CLIENT_PROTOCOL_VERSION (${MIN_CLIENT_PROTOCOL_VERSION}) must not exceed PROTOCOL_VERSION (${PROTOCOL_VERSION}).`,
-      );
+function stringLiteralUnionValues(schema: unknown): string[] | undefined {
+  if (!schema || typeof schema !== "object") {
+    return undefined;
+  }
+  const candidate = schema as { anyOf?: unknown; oneOf?: unknown };
+  const branches = candidate.oneOf ?? candidate.anyOf;
+  if (!Array.isArray(branches) || branches.length === 0) {
+    return undefined;
+  }
+
+  const values: string[] = [];
+  for (const branch of branches) {
+    if (!branch || typeof branch !== "object" || !("const" in branch)) {
+      return undefined;
     }
+    const value = branch.const;
+    if (typeof value !== "string") {
+      return undefined;
+    }
+    values.push(value);
+  }
+  return new Set(values).size === values.length ? values : undefined;
+}
 
-    const swiftGeneratedPath =
-      "apps/shared/OpenClawKit/Sources/OpenClawProtocol/GatewayModels.swift";
+describe("native Gateway protocol levels", () => {
+  it("keeps node and probe compatibility at N-1 without widening general clients", () => {
+    expect(MIN_NODE_PROTOCOL_VERSION).toBe(PROTOCOL_VERSION - 1);
+    expect(MIN_PROBE_PROTOCOL_VERSION).toBe(PROTOCOL_VERSION - 1);
+    expect(MIN_CLIENT_PROTOCOL_VERSION).toBe(PROTOCOL_VERSION);
+  });
+
+  it("emits the session approval event as a discriminated Swift union", async () => {
     const swiftGenerated = await readRepoFile(swiftGeneratedPath);
-    assertLevelsMatch(swiftGeneratedPath, {
-      min: extractInteger(
-        swiftGenerated,
-        /public let GATEWAY_MIN_PROTOCOL_VERSION = (\d+)/,
-        swiftGeneratedPath,
-        "GATEWAY_MIN_PROTOCOL_VERSION",
-      ),
-      max: extractInteger(
-        swiftGenerated,
-        /public let GATEWAY_PROTOCOL_VERSION = (\d+)/,
-        swiftGeneratedPath,
-        "GATEWAY_PROTOCOL_VERSION",
-      ),
-    });
 
-    const androidPath = "apps/android/app/src/main/java/ai/openclaw/app/gateway/GatewayProtocol.kt";
-    const android = await readRepoFile(androidPath);
-    assertLevelsMatch(androidPath, {
-      min: extractInteger(
-        android,
-        /const val GATEWAY_MIN_PROTOCOL_VERSION = (\d+)/,
-        androidPath,
-        "GATEWAY_MIN_PROTOCOL_VERSION",
-      ),
-      max: extractInteger(
-        android,
-        /const val GATEWAY_PROTOCOL_VERSION = (\d+)/,
-        androidPath,
-        "GATEWAY_PROTOCOL_VERSION",
-      ),
-    });
+    assertPattern(
+      swiftGenerated,
+      swiftGeneratedPath,
+      /public enum SessionApprovalEvent: Codable, Sendable \{/,
+      "missing the generated SessionApprovalEvent union.",
+    );
+    assertPattern(
+      swiftGenerated,
+      swiftGeneratedPath,
+      /case pending\(PendingSessionApprovalEvent\)/,
+      "SessionApprovalEvent must decode pending transitions.",
+    );
+    assertPattern(
+      swiftGenerated,
+      swiftGeneratedPath,
+      /case terminal\(TerminalSessionApprovalEvent\)/,
+      "SessionApprovalEvent must decode terminal transitions.",
+    );
+  });
+
+  it("emits the scope upgrade result as a discriminated Swift union", async () => {
+    const swiftGenerated = await readRepoFile(swiftGeneratedPath);
+
+    assertPattern(
+      swiftGenerated,
+      swiftGeneratedPath,
+      /public enum ScopeUpgradeResult: Codable, Sendable \{/,
+      "missing the generated ScopeUpgradeResult union.",
+    );
+    assertPattern(
+      swiftGenerated,
+      swiftGeneratedPath,
+      /case approved\(ScopeUpgradeApproved\)/,
+      "ScopeUpgradeResult must decode approved outcomes.",
+    );
+    assertPattern(
+      swiftGenerated,
+      swiftGeneratedPath,
+      /case rejected\(ScopeUpgradeRejected\)/,
+      "ScopeUpgradeResult must decode rejected outcomes.",
+    );
+    assertPattern(
+      swiftGenerated,
+      swiftGeneratedPath,
+      /case expired\(ScopeUpgradeExpired\)/,
+      "ScopeUpgradeResult must decode expired outcomes.",
+    );
   });
 
   it("uses the min constant for native connect compatibility ranges", async () => {
-    const swiftConnectFiles = [
-      "apps/shared/OpenClawKit/Sources/OpenClawKit/GatewayChannel.swift",
-      "apps/macos/Sources/OpenClawMacCLI/WizardCommand.swift",
-    ];
-    for (const relativePath of swiftConnectFiles) {
-      const content = await readRepoFile(relativePath);
-      assertPattern(
-        content,
-        relativePath,
-        /"minProtocol": ProtoAnyCodable\(GATEWAY_MIN_PROTOCOL_VERSION\)/,
-        "connect params must advertise GATEWAY_MIN_PROTOCOL_VERSION as minProtocol.",
-      );
-      assertPattern(
-        content,
-        relativePath,
-        /"maxProtocol": ProtoAnyCodable\(GATEWAY_PROTOCOL_VERSION\)/,
-        "connect params must advertise GATEWAY_PROTOCOL_VERSION as maxProtocol.",
-      );
-    }
+    const swiftChannelPath = "apps/shared/OpenClawKit/Sources/OpenClawKit/GatewayChannel.swift";
+    const swiftChannel = await readRepoFile(swiftChannelPath);
+    const swiftRangePath =
+      "apps/shared/OpenClawKit/Sources/OpenClawKit/GatewayConnectFailureBackoff.swift";
+    const swiftRange = await readRepoFile(swiftRangePath);
+    assertPattern(
+      swiftRange,
+      swiftRangePath,
+      /if role == "node", clientMode == "node" \{\s+return GATEWAY_MIN_NODE_PROTOCOL_VERSION\s+\}\s+return GATEWAY_MIN_PROTOCOL_VERSION/,
+      "node connections must use the node compatibility floor without changing operator clients.",
+    );
+    assertPattern(
+      swiftChannel,
+      swiftChannelPath,
+      /var supportedProtocols: ClosedRange<Int> \{\s+Self\.minimumProtocolVersion\(\s+role: self\.connectOptions\?\.role \?\? "operator",\s+clientMode: self\.connectOptions\?\.clientMode \?\? "ui"\)\.\.\.GATEWAY_PROTOCOL_VERSION\s+\}/,
+      "the shared range must use the configured role and mode through GATEWAY_PROTOCOL_VERSION.",
+    );
+    assertPattern(
+      swiftChannel,
+      swiftChannelPath,
+      /let protocols = self\.supportedProtocols/,
+      "connect params must use the shared supported protocol range.",
+    );
+    assertPattern(
+      swiftChannel,
+      swiftChannelPath,
+      /"minProtocol": ProtoAnyCodable\(protocols\.lowerBound\)/,
+      "connect params must advertise the role-specific minimum as minProtocol.",
+    );
+    assertPattern(
+      swiftChannel,
+      swiftChannelPath,
+      /"maxProtocol": ProtoAnyCodable\(protocols\.upperBound\)/,
+      "connect params must advertise GATEWAY_PROTOCOL_VERSION as maxProtocol.",
+    );
+
+    const watchPath = "apps/ios/WatchApp/Sources/WatchDirectNode.swift";
+    const watch = await readRepoFile(watchPath);
+    assertPattern(
+      watch,
+      watchPath,
+      /minprotocol: GATEWAY_MIN_PROTOCOL_VERSION/,
+      "Direct Watch HTTP connects must keep the current client protocol floor.",
+    );
+    assertPattern(
+      watch,
+      watchPath,
+      /maxprotocol: GATEWAY_PROTOCOL_VERSION/,
+      "Watch node connects must advertise GATEWAY_PROTOCOL_VERSION as maxProtocol.",
+    );
+
+    const swiftWizardPath = "apps/macos/Sources/OpenClawMacCLI/WizardCommand.swift";
+    const swiftWizard = await readRepoFile(swiftWizardPath);
+    assertPattern(
+      swiftWizard,
+      swiftWizardPath,
+      /"minProtocol": ProtoAnyCodable\(GATEWAY_MIN_PROTOCOL_VERSION\)/,
+      "operator connects must advertise GATEWAY_MIN_PROTOCOL_VERSION as minProtocol.",
+    );
+    assertPattern(
+      swiftWizard,
+      swiftWizardPath,
+      /"maxProtocol": ProtoAnyCodable\(GATEWAY_PROTOCOL_VERSION\)/,
+      "operator connects must advertise GATEWAY_PROTOCOL_VERSION as maxProtocol.",
+    );
 
     const androidPath = "apps/android/app/src/main/java/ai/openclaw/app/gateway/GatewaySession.kt";
     const android = await readRepoFile(androidPath);
@@ -134,34 +209,30 @@ describe("native Gateway protocol levels", () => {
     );
   });
 
-  it("uses the TypeScript source of truth for dev Gateway smoke scripts", async () => {
-    const devScripts = ["scripts/dev/gateway-smoke.ts", "scripts/dev/ios-node-e2e.ts"];
-    for (const relativePath of devScripts) {
-      const content = await readRepoFile(relativePath);
-      assertPattern(
-        content,
-        relativePath,
-        /MIN_CLIENT_PROTOCOL_VERSION/,
-        "connect params must import/use MIN_CLIENT_PROTOCOL_VERSION as minProtocol.",
-      );
-      assertPattern(
-        content,
-        relativePath,
-        /PROTOCOL_VERSION/,
-        "connect params must import/use PROTOCOL_VERSION as maxProtocol.",
-      );
-      assertPattern(
-        content,
-        relativePath,
-        /minProtocol:\s*MIN_CLIENT_PROTOCOL_VERSION/,
-        "connect params must advertise MIN_CLIENT_PROTOCOL_VERSION as minProtocol.",
-      );
-      assertPattern(
-        content,
-        relativePath,
-        /maxProtocol:\s*PROTOCOL_VERSION/,
-        "connect params must advertise PROTOCOL_VERSION as maxProtocol.",
-      );
+  it("emits named string-literal unions as Swift enums", async () => {
+    const swiftGenerated = await readRepoFile(swiftGeneratedPath);
+
+    for (const [name, schema] of Object.entries(ProtocolSchemas)) {
+      const values = stringLiteralUnionValues(schema);
+      if (!values) {
+        continue;
+      }
+
+      const enumStart = `public enum ${name}: String, Codable, Sendable {`;
+      const start = swiftGenerated.indexOf(enumStart);
+      if (start < 0) {
+        throw new Error(`${swiftGeneratedPath}: missing Swift enum for ${name}.`);
+      }
+      const end = swiftGenerated.indexOf("\n}\n", start);
+      const enumSource = swiftGenerated.slice(start, end);
+      for (const value of values) {
+        assertPattern(
+          enumSource,
+          swiftGeneratedPath,
+          new RegExp(`= ${JSON.stringify(value)}$`, "m"),
+          `${name} must include the ${JSON.stringify(value)} literal.`,
+        );
+      }
     }
   });
 });

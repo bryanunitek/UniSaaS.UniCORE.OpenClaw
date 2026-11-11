@@ -1,56 +1,85 @@
+/**
+ * Config-aware system prompt builder.
+ *
+ * This module gathers agent/config knobs before rendering the canonical system
+ * prompt so callers do not duplicate owner, TTS, alias, memory, or FS policy.
+ */
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import { shouldHandleTextCommands } from "../auto-reply/commands-text-routing.js";
+import { isRestartEnabled } from "../config/commands.flags.js";
+import { resolveNativeCommandsEnabled } from "../config/commands.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { buildTtsSystemPromptHint } from "../tts/tts.js";
-import { resolveAgentConfig } from "./agent-scope.js";
-import { buildModelAliasLines } from "./model-alias-lines.js";
-import { resolveOwnerDisplaySetting } from "./owner-display.js";
+import type { PreparedTtsPreferences } from "../tts/tts-preferences.js";
+import { buildTtsSystemPromptHint } from "../tts/tts-settings.js";
+import { resolveMainSessionDelegationMode } from "./delegation-guidance.js";
+import type { PreparedModelRuntimeSnapshot } from "./prepared-model-runtime.types.js";
 import { buildAgentSystemPrompt } from "./system-prompt.js";
 import { resolveEffectiveToolFsWorkspaceOnly } from "./tool-fs-policy.js";
 
-type AgentSystemPromptRenderParams = Parameters<typeof buildAgentSystemPrompt>[0];
-
-export type ResolvedAgentSystemPromptConfig = Pick<
-  AgentSystemPromptRenderParams,
-  | "ownerDisplay"
-  | "ownerDisplaySecret"
-  | "subagentDelegationMode"
-  | "ttsHint"
-  | "modelAliasLines"
-  | "memoryCitationsMode"
-  | "fsWorkspaceOnly"
->;
-
-export type ConfiguredAgentSystemPromptParams = AgentSystemPromptRenderParams & {
+type ConfiguredAgentSystemPromptParams = Parameters<typeof buildAgentSystemPrompt>[0] & {
   config?: OpenClawConfig;
   agentId?: string;
+  preparedTtsPreferences?: PreparedTtsPreferences;
+  tools?: { name: string; parameters: unknown }[];
+  preparedModelRuntime?: Pick<PreparedModelRuntimeSnapshot, "configuredModelAliases">;
 };
 
-export function resolveAgentSystemPromptConfig(params: {
-  config?: OpenClawConfig;
-  agentId?: string;
-}): ResolvedAgentSystemPromptConfig {
-  const { config, agentId } = params;
-  const ownerDisplay = resolveOwnerDisplaySetting(config);
-  const agentSubagents =
-    config && agentId ? resolveAgentConfig(config, agentId)?.subagents : undefined;
-  return {
-    ownerDisplay: ownerDisplay.ownerDisplay,
-    ownerDisplaySecret: ownerDisplay.ownerDisplaySecret,
-    subagentDelegationMode:
-      agentSubagents?.delegationMode ??
-      config?.agents?.defaults?.subagents?.delegationMode ??
-      "suggest",
-    ttsHint: config ? buildTtsSystemPromptHint(config, agentId) : undefined,
-    modelAliasLines: buildModelAliasLines(config),
-    memoryCitationsMode: config?.memory?.citations,
-    fsWorkspaceOnly: resolveEffectiveToolFsWorkspaceOnly({ cfg: config, agentId }),
-  };
+function buildModelAliasLines(owner: ConfiguredAgentSystemPromptParams["preparedModelRuntime"]) {
+  if (!owner) {
+    return [];
+  }
+  return (owner.configuredModelAliases ?? [])
+    .toSorted((a, b) => a.alias.localeCompare(b.alias))
+    .map(({ alias, provider, model }) => `- ${alias}: ${provider}/${model}`);
 }
 
+/** Builds the agent system prompt after applying config-derived prompt fields. */
 export function buildConfiguredAgentSystemPrompt(params: ConfiguredAgentSystemPromptParams) {
-  const { config, agentId, ...renderParams } = params;
-  const configParams = config ? resolveAgentSystemPromptConfig({ config, agentId }) : {};
+  const {
+    config,
+    tools,
+    agentId: explicitAgentId,
+    preparedModelRuntime,
+    preparedTtsPreferences,
+    ...renderParams
+  } = params;
+  const agentId = explicitAgentId ?? (tools ? params.runtimeInfo?.agentId : undefined);
+  if (tools) {
+    renderParams.toolNames = tools.map((tool) => tool.name);
+    renderParams.messageTool = tools.find((tool) => tool.name.trim().toLowerCase() === "message");
+  }
+  if (!config) {
+    return buildAgentSystemPrompt(renderParams);
+  }
+  const channel = normalizeOptionalLowercaseString(renderParams.runtimeInfo?.channel) ?? "";
+  const includeFullSections =
+    renderParams.promptMode !== "minimal" && renderParams.promptMode !== "none";
   return buildAgentSystemPrompt({
     ...renderParams,
-    ...configParams,
+    reasoningCommandsEnabled:
+      shouldHandleTextCommands({ cfg: config, surface: channel }) ||
+      resolveNativeCommandsEnabled({
+        providerId: channel,
+        providerSetting: config.channels?.[channel]?.commands?.native,
+        globalSetting: config.commands?.native,
+        config,
+      }),
+    restartCommandsEnabled: isRestartEnabled(config),
+    ownerDisplay: "raw",
+    ownerDisplaySecret: undefined,
+    subagentDelegationMode: resolveMainSessionDelegationMode({
+      config,
+      agentId,
+      sessionKey: renderParams.runtimeInfo?.sessionKey,
+    }),
+    ttsHint: includeFullSections
+      ? buildTtsSystemPromptHint(config, agentId, {
+          preparedTtsPreferences,
+          messageToolOnly: renderParams.sourceReplyDeliveryMode === "message_tool_only",
+        })
+      : undefined,
+    modelAliasLines: includeFullSections ? buildModelAliasLines(preparedModelRuntime) : [],
+    memoryCitationsMode: config.memory?.citations,
+    fsWorkspaceOnly: resolveEffectiveToolFsWorkspaceOnly({ cfg: config, agentId }),
   });
 }

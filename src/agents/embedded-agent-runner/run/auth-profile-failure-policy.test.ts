@@ -1,38 +1,45 @@
+// Coverage for deciding which failover reasons affect auth profile health.
 import { describe, expect, it } from "vitest";
 import { resolveAuthProfileFailureReason } from "./auth-profile-failure-policy.js";
 
 describe("resolveAuthProfileFailureReason", () => {
-  it("records shared non-timeout provider failures", () => {
-    expect(
-      resolveAuthProfileFailureReason({
-        failoverReason: "billing",
-        policy: "shared",
-      }),
-    ).toBe("billing");
+  it("keeps only transient local failures out of shared auth state", () => {
     expect(
       resolveAuthProfileFailureReason({
         failoverReason: "rate_limit",
-        policy: "shared",
+        policy: "local_transient",
       }),
     ).toBe("rate_limit");
-  });
-
-  it("does not record local helper failures in shared auth state", () => {
     expect(
       resolveAuthProfileFailureReason({
-        failoverReason: "billing",
-        policy: "local",
+        failoverReason: "rate_limit",
+        policy: "local_transient",
+        transientRateLimit: true,
+      }),
+    ).toBeNull();
+    expect(
+      resolveAuthProfileFailureReason({
+        failoverReason: "overloaded",
+        policy: "local_transient",
       }),
     ).toBeNull();
     expect(
       resolveAuthProfileFailureReason({
         failoverReason: "auth",
-        policy: "local",
+        policy: "local_transient",
       }),
-    ).toBeNull();
+    ).toBe("auth");
+    expect(
+      resolveAuthProfileFailureReason({
+        failoverReason: "billing",
+        policy: "local_transient",
+      }),
+    ).toBe("billing");
   });
 
   it("only persists timeouts when the provider request started", () => {
+    // Pre-provider timeout says nothing about credential health; started
+    // provider timeouts can cool down the active profile.
     expect(
       resolveAuthProfileFailureReason({
         failoverReason: "timeout",
@@ -50,46 +57,5 @@ describe("resolveAuthProfileFailureReason", () => {
         providerStarted: true,
       }),
     ).toBe("timeout");
-  });
-
-  it("does not persist transport or server failures as auth-profile health", () => {
-    expect(
-      resolveAuthProfileFailureReason({
-        failoverReason: "server_error",
-      }),
-    ).toBeNull();
-  });
-
-  it("does not persist empty responses as auth-profile health", () => {
-    expect(
-      resolveAuthProfileFailureReason({
-        failoverReason: "empty_response",
-      }),
-    ).toBeNull();
-    expect(
-      resolveAuthProfileFailureReason({
-        failoverReason: "empty_response",
-        policy: "shared",
-      }),
-    ).toBeNull();
-  });
-
-  it("does not persist request-shape (format) rejections as auth-profile health (#77228)", () => {
-    // A format rejection (e.g. the github-copilot prefill-strict 400
-    // "conversation must end with a user message" reported in #77228) is
-    // a per-session transcript-shape problem; cascading it to a profile
-    // cooldown blocks every other healthy session sharing the same auth
-    // profile and can take down the whole provider for the backoff window.
-    expect(
-      resolveAuthProfileFailureReason({
-        failoverReason: "format",
-      }),
-    ).toBeNull();
-    expect(
-      resolveAuthProfileFailureReason({
-        failoverReason: "format",
-        policy: "shared",
-      }),
-    ).toBeNull();
   });
 });

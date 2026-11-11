@@ -1,51 +1,53 @@
 import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
+import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 
-export async function withTimeout<T>(
-  work: (signal: AbortSignal | undefined) => Promise<T>,
+/**
+ * Run bounded work; dynamic labels identify the stage pending at the deadline.
+ * `resetTimeout` re-arms the window, but never past `maxTotalMs` from the start.
+ */
+export async function runAbortableTimeout<T>(
+  work: (signal: AbortSignal | undefined, resetTimeout: () => void) => Promise<T>,
   timeoutMs?: number,
-  label?: string,
+  label?: string | (() => string),
+  maxTotalMs?: number,
 ): Promise<T> {
   const resolved = timeoutMs === undefined ? undefined : resolveTimerTimeoutMs(timeoutMs, 1);
   if (!resolved) {
-    return await work(undefined);
+    return await work(undefined, () => {});
   }
 
   const abortCtrl = new AbortController();
-  const timeoutError = new Error(`${label ?? "request"} timed out`);
-  const timer = setTimeout(() => abortCtrl.abort(timeoutError), resolved);
-  timer.unref?.();
-
-  let abortListener: (() => void) | undefined;
-  const abortPromise: Promise<never> = abortCtrl.signal.aborted
-    ? Promise.reject(
-        toLintErrorObject(abortCtrl.signal.reason ?? timeoutError, "Non-Error rejection"),
-      )
-    : new Promise((_, reject) => {
-        abortListener = () =>
-          reject(toLintErrorObject(abortCtrl.signal.reason ?? timeoutError, "Non-Error rejection"));
-        abortCtrl.signal.addEventListener("abort", abortListener, { once: true });
-      });
+  // Keep the deadline on the monotonic clock setTimeout arms on, so wall-clock jumps
+  // can't inflate or collapse the remaining window resetTimeout re-reads across ticks.
+  const deadline = maxTotalMs === undefined ? undefined : performance.now() + maxTotalMs;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
+  const resetTimeout = () => {
+    const remainingMs = (deadline ?? Number.POSITIVE_INFINITY) - performance.now();
+    // At the deadline the armed window is already due; re-arming would postpone it.
+    if (settled || abortCtrl.signal.aborted || (timer && remainingMs <= 0)) {
+      return;
+    }
+    clearTimeout(timer);
+    timer = setTimeout(
+      () => {
+        const operation = typeof label === "function" ? label() : (label ?? "request");
+        abortCtrl.abort(new Error(`${operation} timed out`));
+      },
+      Math.max(0, Math.min(resolved, remainingMs)),
+    );
+    timer.unref?.();
+  };
+  resetTimeout();
 
   try {
-    return await Promise.race([work(abortCtrl.signal), abortPromise]);
+    return await racePromiseWithAbortSignal(
+      work(abortCtrl.signal, resetTimeout),
+      abortCtrl.signal,
+      (signal) => signal.reason,
+    );
   } finally {
+    settled = true;
     clearTimeout(timer);
-    if (abortListener) {
-      abortCtrl.signal.removeEventListener("abort", abortListener);
-    }
   }
-}
-
-function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
-  if (value instanceof Error) {
-    return value;
-  }
-  if (typeof value === "string") {
-    return new Error(value);
-  }
-  const error = new Error(fallbackMessage, { cause: value });
-  if ((typeof value === "object" && value !== null) || typeof value === "function") {
-    Object.assign(error, value);
-  }
-  return error;
 }

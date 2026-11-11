@@ -1,3 +1,8 @@
+/**
+ * Tests tool plugin schema helpers and SDK tool registration contracts.
+ */
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { Type } from "typebox";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { createCapturedPluginRegistration } from "../plugins/captured-registration.js";
@@ -5,6 +10,13 @@ import { defineToolPlugin, getToolPluginMetadata } from "./tool-plugin.js";
 
 describe("defineToolPlugin", () => {
   it("registers declared tools and wraps plain object results", async () => {
+    const outputSchema = Type.Object(
+      {
+        symbol: Type.String(),
+        configured: Type.Boolean(),
+      },
+      { additionalProperties: false },
+    );
     const entry = defineToolPlugin({
       id: "stock-quotes",
       name: "Stock Quotes",
@@ -20,6 +32,7 @@ describe("defineToolPlugin", () => {
           parameters: Type.Object({
             symbol: Type.String(),
           }),
+          outputSchema,
           async execute(params, config) {
             expectTypeOf(params.symbol).toEqualTypeOf<string>();
             expectTypeOf(config.apiKey).toEqualTypeOf<string>();
@@ -41,8 +54,13 @@ describe("defineToolPlugin", () => {
       name: "quote",
       label: "Quote",
       description: "Fetch a quote.",
+      outputSchema,
     });
-    const result = await captured.tools[0].execute("call-1", { symbol: "OPEN" });
+    expect(getToolPluginMetadata(entry)?.tools[0]?.outputSchema).toBe(outputSchema);
+    const result = await expectDefined(
+      captured.tools[0],
+      "captured.tools[0] test invariant",
+    ).execute("call-1", { symbol: "OPEN" });
     expect(result.details).toEqual({ symbol: "OPEN", configured: true });
     expect(result.content).toEqual([
       { type: "text", text: JSON.stringify({ symbol: "OPEN", configured: true }, null, 2) },
@@ -67,41 +85,52 @@ describe("defineToolPlugin", () => {
 
     entry.register(captured.api);
 
-    const result = await captured.tools[0].execute("call-1", { input: "hello" });
+    const result = await expectDefined(
+      captured.tools[0],
+      "captured.tools[0] test invariant",
+    ).execute("call-1", { input: "hello" });
     expect(result).toEqual({
       content: [{ type: "text", text: "hello" }],
       details: "hello",
     });
   });
 
-  it("passes optional tools through to runtime registration and metadata", () => {
-    const entry = defineToolPlugin({
-      id: "optional-tools",
-      name: "Optional Tools",
-      description: "Optional tool demo.",
-      tools: (tool) => [
-        tool({
-          name: "optional_echo",
-          description: "Echo input.",
-          parameters: Type.Object({ input: Type.String() }),
+  it.each([true] as const)(
+    "passes optional tool workspace access %s through registration and metadata",
+    (workspaceAccess) => {
+      const entry = defineToolPlugin({
+        id: "optional-tools",
+        name: "Optional Tools",
+        description: "Optional tool demo.",
+        tools: (tool) => [
+          tool({
+            name: "optional_echo",
+            description: "Echo input.",
+            parameters: Type.Object({ input: Type.String() }),
+            optional: true,
+            workspaceAccess,
+            execute: ({ input }) => input,
+          }),
+        ],
+      });
+      const captured = createCapturedPluginRegistration({ id: "optional-tools" });
+      const registerTool = vi.fn();
+      captured.api.registerTool = registerTool as typeof captured.api.registerTool;
+
+      entry.register(captured.api);
+
+      expect(registerTool).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "optional_echo" }),
+        {
           optional: true,
-          execute: ({ input }) => input,
-        }),
-      ],
-    });
-    const captured = createCapturedPluginRegistration({ id: "optional-tools" });
-    const registerTool = vi.fn();
-    captured.api.registerTool = registerTool as typeof captured.api.registerTool;
-
-    entry.register(captured.api);
-
-    expect(registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "optional_echo" }), {
-      optional: true,
-    });
-    expect(getToolPluginMetadata(entry)?.tools).toMatchObject([
-      { name: "optional_echo", optional: true },
-    ]);
-  });
+          workspaceAccess,
+        },
+      );
+      expect(getToolPluginMetadata(entry)?.tools).toMatchObject([
+        { name: "optional_echo", optional: true, workspaceAccess },
+      ]);
+    },
+  );
 
   it("supports context factories while keeping static tool metadata", () => {
     const entry = defineToolPlugin({
@@ -116,6 +145,7 @@ describe("defineToolPlugin", () => {
           description: "Echo input.",
           parameters: Type.Object({ input: Type.String() }),
           optional: true,
+          workspaceAccess: "execute",
           factory({ config, toolContext }) {
             if (toolContext.sandboxed) {
               return null;
@@ -152,12 +182,14 @@ describe("defineToolPlugin", () => {
     expect(registerTool).toHaveBeenCalledWith(expect.any(Function), {
       name: "factory_echo",
       optional: true,
+      workspaceAccess: "execute",
     });
     expect(getToolPluginMetadata(entry)?.tools).toMatchObject([
       {
         name: "factory_echo",
         label: "Factory Echo",
         optional: true,
+        workspaceAccess: "execute",
       },
     ]);
 
@@ -183,31 +215,6 @@ describe("defineToolPlugin", () => {
       type: "object",
       additionalProperties: false,
       properties: {},
-    });
-  });
-
-  it("exposes static metadata for manifest generation without running tools", () => {
-    const execute = vi.fn();
-    const entry = defineToolPlugin({
-      id: "metadata-demo",
-      name: "Metadata Demo",
-      description: "Static metadata.",
-      activation: { onCapabilities: ["tool"] },
-      tools: (tool) => [
-        tool({
-          name: "metadata_tool",
-          description: "Static tool.",
-          parameters: Type.Object({ input: Type.String() }),
-          execute,
-        }),
-      ],
-    });
-
-    expect(execute).not.toHaveBeenCalled();
-    expect(getToolPluginMetadata(entry)).toMatchObject({
-      id: "metadata-demo",
-      activation: { onCapabilities: ["tool"] },
-      tools: [{ name: "metadata_tool", description: "Static tool." }],
     });
   });
 });

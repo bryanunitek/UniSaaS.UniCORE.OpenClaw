@@ -1,16 +1,19 @@
+/**
+ * Shared realtime voice controls for active OpenClaw agent runs.
+ *
+ * This module owns the provider-facing control tool, conservative intent
+ * classifier, and user-visible status/queue/cancel messages used by Talk.
+ */
+import { asNonArrayRecord, asRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
+import { isStringOption, readTrimmedStringAlias } from "../utils/string-readers.js";
 import type { RealtimeVoiceTool } from "./provider-types.js";
 import type { TalkEvent } from "./talk-events.js";
 
-export const REALTIME_VOICE_AGENT_CONTROL_MODES = [
-  "status",
-  "steer",
-  "cancel",
-  "followup",
-] as const;
+const REALTIME_VOICE_AGENT_CONTROL_MODES = ["status", "steer", "cancel", "followup"] as const;
 
 export type RealtimeVoiceAgentControlMode = (typeof REALTIME_VOICE_AGENT_CONTROL_MODES)[number];
 
@@ -19,6 +22,7 @@ export type RealtimeVoiceAgentControlProviderResult = {
   message: string;
 };
 
+/** Stable provider-facing tool name for active-run voice control. */
 export const REALTIME_VOICE_AGENT_CONTROL_TOOL_NAME = "openclaw_agent_control";
 
 export const REALTIME_VOICE_AGENT_CONTROL_TOOL: RealtimeVoiceTool = {
@@ -44,7 +48,7 @@ export const REALTIME_VOICE_AGENT_CONTROL_TOOL: RealtimeVoiceTool = {
   },
 };
 
-export type RealtimeVoiceAgentControlIntent = {
+type RealtimeVoiceAgentControlIntent = {
   mode: RealtimeVoiceAgentControlMode;
   confidence: "high" | "medium" | "low";
   reason:
@@ -57,6 +61,7 @@ export type RealtimeVoiceAgentControlIntent = {
   shouldAutoControl: boolean;
 };
 
+/** Snapshot of active work used when recent Talk events cannot describe status. */
 export type RealtimeVoiceAgentRunActivity = {
   activeWorkKind?: "tool_call" | "model_call" | "embedded_run";
   hasActiveEmbeddedRun?: boolean;
@@ -86,13 +91,11 @@ export type RealtimeVoiceAgentControlResult = {
   deliveredAtMs?: number;
 };
 
-export function normalizeRealtimeVoiceAgentControlMode(
+function normalizeRealtimeVoiceAgentControlMode(
   value: unknown,
 ): RealtimeVoiceAgentControlMode | undefined {
   const normalized = normalizeOptionalLowercaseString(value);
-  return REALTIME_VOICE_AGENT_CONTROL_MODES.includes(normalized as RealtimeVoiceAgentControlMode)
-    ? (normalized as RealtimeVoiceAgentControlMode)
-    : undefined;
+  return isStringOption(normalized, REALTIME_VOICE_AGENT_CONTROL_MODES) ? normalized : undefined;
 }
 
 const CANCEL_CONTROL_PATTERNS = [
@@ -127,10 +130,6 @@ const STOP_REDIRECT_CONTROL_PATTERNS = [
   /^(?:(?:ok|okay|alright|all right)[,\s]+)?(?:please\s+)?stop\s+(?:that|this|it|the\s+(?:check|run|task|work))\s+from\b/,
 ] as const;
 
-function matchesAnyPattern(text: string, patterns: readonly RegExp[]): boolean {
-  return patterns.some((pattern) => pattern.test(text));
-}
-
 function hasNegatedCancelIntent(text: string): boolean {
   return (
     /\b(?:don'?t|do\s+not|not|never)\s+(?:please\s+)?(?:cancel|cancle|stop|abort|kill|end)\b/.test(
@@ -139,6 +138,15 @@ function hasNegatedCancelIntent(text: string): boolean {
   );
 }
 
+const CONTROL_INTENT_RULES = [
+  ["steer", "steer_command", STOP_REDIRECT_CONTROL_PATTERNS],
+  ["cancel", "cancel_safety", CANCEL_CONTROL_PATTERNS],
+  ["status", "status_query", STATUS_CONTROL_PATTERNS],
+  ["followup", "followup_marker", FOLLOWUP_CONTROL_PATTERNS],
+  ["steer", "steer_command", STEER_CONTROL_PATTERNS],
+] as const;
+
+/** Classify raw spoken control text with conservative auto-control gating. */
 export function resolveRealtimeVoiceAgentControlIntent(params: {
   text: string;
   mode?: unknown;
@@ -153,50 +161,21 @@ export function resolveRealtimeVoiceAgentControlIntent(params: {
     };
   }
 
-  const text = params.text;
-  const normalized = text.trim().toLowerCase();
-  if (matchesAnyPattern(normalized, STOP_REDIRECT_CONTROL_PATTERNS)) {
-    return {
-      mode: "steer",
-      confidence: "medium",
-      reason: "steer_command",
-      shouldAutoControl: true,
-    };
-  }
-  if (
-    !hasNegatedCancelIntent(normalized) &&
-    matchesAnyPattern(normalized, CANCEL_CONTROL_PATTERNS)
-  ) {
-    return {
-      mode: "cancel",
-      confidence: "high",
-      reason: "cancel_safety",
-      shouldAutoControl: true,
-    };
-  }
-  if (matchesAnyPattern(normalized, STATUS_CONTROL_PATTERNS)) {
-    return {
-      mode: "status",
-      confidence: "high",
-      reason: "status_query",
-      shouldAutoControl: true,
-    };
-  }
-  if (matchesAnyPattern(normalized, FOLLOWUP_CONTROL_PATTERNS)) {
-    return {
-      mode: "followup",
-      confidence: "high",
-      reason: "followup_marker",
-      shouldAutoControl: true,
-    };
-  }
-  if (matchesAnyPattern(normalized, STEER_CONTROL_PATTERNS)) {
-    return {
-      mode: "steer",
-      confidence: "medium",
-      reason: "steer_command",
-      shouldAutoControl: true,
-    };
+  const normalized = params.text.trim().toLowerCase();
+  // "Stop using X" redirects the active work; it must not be treated as an
+  // abort of the whole run just because it starts with "stop".
+  for (const [mode, reason, patterns] of CONTROL_INTENT_RULES) {
+    if (
+      (mode !== "cancel" || !hasNegatedCancelIntent(normalized)) &&
+      patterns.some((pattern) => pattern.test(normalized))
+    ) {
+      return {
+        mode,
+        confidence: mode === "steer" ? "medium" : "high",
+        reason,
+        shouldAutoControl: true,
+      };
+    }
   }
   return {
     mode: "status",
@@ -206,58 +185,56 @@ export function resolveRealtimeVoiceAgentControlIntent(params: {
   };
 }
 
+/** Return the best control mode for a spoken utterance, even if auto-routing is unsafe. */
 export function classifyRealtimeVoiceAgentControlText(text: string): RealtimeVoiceAgentControlMode {
   return resolveRealtimeVoiceAgentControlIntent({ text }).mode;
 }
 
+/** Whether a spoken utterance is safe to route automatically to the control tool. */
 export function shouldAutoControlRealtimeVoiceAgentText(text: string): boolean {
   return resolveRealtimeVoiceAgentControlIntent({ text }).shouldAutoControl;
 }
 
+/** Parse provider-owned control tool args from JSON strings or object payloads. */
 export function parseRealtimeVoiceAgentControlToolArgs(args: unknown): {
   text: string;
   mode: RealtimeVoiceAgentControlMode;
 } {
-  const parsed = parseRealtimeVoiceAgentControlToolArgsRecord(args);
-  const record = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-  const text =
-    normalizeOptionalString((record as Record<string, unknown>).text) ??
-    normalizeOptionalString((record as Record<string, unknown>).message) ??
-    normalizeOptionalString((record as Record<string, unknown>).request) ??
-    normalizeOptionalString((record as Record<string, unknown>).query);
+  let parsed = args;
+  if (typeof args === "string") {
+    const trimmed = args.trim();
+    try {
+      parsed = trimmed ? JSON.parse(trimmed) : {};
+    } catch {
+      parsed = { text: trimmed };
+    }
+  }
+  const record = asNonArrayRecord(parsed);
+  const text = readTrimmedStringAlias(record, ["text", "message", "request", "query"]);
   if (!text) {
     throw new Error("text required");
   }
   const mode =
-    normalizeRealtimeVoiceAgentControlMode((record as Record<string, unknown>).mode) ??
+    normalizeRealtimeVoiceAgentControlMode(record.mode) ??
     resolveRealtimeVoiceAgentControlIntent({ text }).mode;
   return { text, mode };
 }
 
-function parseRealtimeVoiceAgentControlToolArgsRecord(args: unknown): unknown {
-  if (typeof args !== "string") {
-    return args;
-  }
-  const trimmed = args.trim();
-  if (!trimmed) {
-    return {};
-  }
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    return { text: trimmed };
-  }
-}
+/** Fixed user-visible failure; private execution/readiness errors stay in host diagnostics. */
+export const REALTIME_VOICE_AGENT_CONTROL_FAILURE_MESSAGE =
+  "OpenClaw could not process that voice control. Please try again.";
 
+/** Build the system-style instruction that forces exact spoken status output. */
 export function buildRealtimeVoiceAgentControlSpeechMessage(text: string): string {
   return [
     "Internal OpenClaw voice control result.",
-    "Do not call openclaw_agent_consult or any other tool for this message.",
+    "Do not delegate this message or call any tools.",
     "Speak this exact OpenClaw status to the voice call, without adding, removing, or rephrasing words.",
     `Status: ${JSON.stringify(text)}`,
   ].join("\n");
 }
 
+/** Provider result payload used when the control tool cancels active work. */
 export function buildRealtimeVoiceAgentCancelProviderResult(
   message = "Cancelled the active OpenClaw run.",
 ): RealtimeVoiceAgentControlProviderResult {
@@ -267,6 +244,7 @@ export function buildRealtimeVoiceAgentCancelProviderResult(
   };
 }
 
+/** Wrap follow-up text so an active run treats it as deferred context. */
 export function buildRealtimeVoiceAgentFollowupSteeringText(text: string): string {
   return [
     "Spoken follow-up for the current voice call.",
@@ -276,10 +254,14 @@ export function buildRealtimeVoiceAgentFollowupSteeringText(text: string): strin
   ].join("\n");
 }
 
+/** User-facing message for queue failures while steering or adding follow-up work. */
 export function formatRealtimeVoiceAgentQueueRejection(
   mode: RealtimeVoiceAgentControlMode,
   reason: string,
 ): string {
+  if (reason === "guarded_injection_unsupported") {
+    return "This agent runtime cannot safely accept scoped voice steering. Check status, cancel the run, or start a new explicit request. Update the runtime when guarded injection is supported.";
+  }
   if (reason === "compacting") {
     return "OpenClaw is compacting the active run and cannot accept voice steering yet.";
   }
@@ -291,38 +273,28 @@ export function formatRealtimeVoiceAgentQueueRejection(
     : "OpenClaw could not steer the active run.";
 }
 
-function isRealtimeVoiceAgentControlToolEvent(event: TalkEvent): boolean {
-  if (!event.type.startsWith("tool.")) {
-    return false;
-  }
-  const payload =
-    event.payload && typeof event.payload === "object"
-      ? (event.payload as Record<string, unknown>)
-      : {};
-  return normalizeOptionalString(payload.name) === REALTIME_VOICE_AGENT_CONTROL_TOOL_NAME;
-}
-
+/** Format a concise spoken status for the active or most recent voice run. */
 export function formatRealtimeVoiceAgentStatus(params: {
   active: boolean;
   recentEvents?: readonly TalkEvent[];
   activity?: RealtimeVoiceAgentRunActivity;
 }): string {
-  const recent = (params.recentEvents ?? []).toReversed();
+  const recent = params.recentEvents ?? [];
   if (!params.active) {
-    const turnEnded = recent.find((event) => event.type === "turn.ended");
+    const turnEnded = recent.findLast((event) => event.type === "turn.ended");
     return turnEnded
       ? "OpenClaw finished the last voice request."
       : "I'm not working on an active request right now.";
   }
 
-  const toolEvent = recent.find(
-    (event) => event.type.startsWith("tool.") && !isRealtimeVoiceAgentControlToolEvent(event),
+  const toolEvent = recent.findLast(
+    (event) =>
+      event.type.startsWith("tool.") &&
+      normalizeOptionalString(asRecord(event.payload).name) !==
+        REALTIME_VOICE_AGENT_CONTROL_TOOL_NAME,
   );
   if (toolEvent) {
-    const payload =
-      toolEvent.payload && typeof toolEvent.payload === "object"
-        ? (toolEvent.payload as Record<string, unknown>)
-        : {};
+    const payload = asRecord(toolEvent.payload);
     const name = normalizeOptionalString(payload.name);
     const phase = normalizeOptionalString(payload.phase);
     if (toolEvent.type === "tool.call") {
@@ -346,9 +318,5 @@ export function formatRealtimeVoiceAgentStatus(params: {
   if (params.activity?.activeWorkKind === "model_call") {
     return "OpenClaw is waiting on the model.";
   }
-  if (params.activity?.activeWorkKind === "embedded_run" || params.activity?.hasActiveEmbeddedRun) {
-    return "OpenClaw is working on the current voice request.";
-  }
-
   return "OpenClaw is working on the current voice request.";
 }

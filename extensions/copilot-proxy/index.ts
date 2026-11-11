@@ -1,4 +1,4 @@
-import { normalizeStringEntries, uniqueStrings } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { normalizeUniqueStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   definePluginEntry,
   type ProviderAuthContext,
@@ -8,18 +8,11 @@ import {
 const DEFAULT_BASE_URL = "http://localhost:3000/v1";
 const DEFAULT_API_KEY = "n/a";
 const DEFAULT_CONTEXT_WINDOW = 128_000;
-const DEFAULT_MAX_TOKENS = 8192;
 const DEFAULT_MODEL_IDS = [
-  "gpt-5.2",
-  "gpt-5.2-codex",
-  "gpt-5.1",
-  "gpt-5.1-codex",
-  "gpt-5.1-codex-max",
   "gpt-5-mini",
   "claude-opus-4.6",
   "claude-opus-4.7",
   "claude-sonnet-4.6",
-  "gemini-3-pro",
   "gemini-3-flash",
 ] as const;
 
@@ -28,14 +21,8 @@ function normalizeBaseUrl(value: string): string {
   if (!trimmed) {
     return DEFAULT_BASE_URL;
   }
-  let normalized = trimmed;
-  while (normalized.endsWith("/")) {
-    normalized = normalized.slice(0, -1);
-  }
-  if (!normalized.endsWith("/v1")) {
-    normalized = `${normalized}/v1`;
-  }
-  return normalized;
+  const normalized = trimmed.replace(/\/+$/, "");
+  return normalized.endsWith("/v1") ? normalized : `${normalized}/v1`;
 }
 
 function validateBaseUrl(value: string): string | undefined {
@@ -44,11 +31,10 @@ function validateBaseUrl(value: string): string | undefined {
 }
 
 function parseModelIds(input: string): string[] {
-  const parsed = normalizeStringEntries(input.split(/[\n,]/));
-  return uniqueStrings(parsed);
+  return normalizeUniqueStringEntries(input.split(/[\n,]/));
 }
 
-function buildModelDefinition(modelId: string) {
+function buildModelDefinition(modelId: string, maxTokens: number) {
   return {
     id: modelId,
     name: modelId,
@@ -57,7 +43,7 @@ function buildModelDefinition(modelId: string) {
     input: ["text", "image"] as Array<"text" | "image">,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
+    maxTokens,
   };
 }
 
@@ -95,6 +81,8 @@ export default definePluginEntry({
             const defaultModelId = modelIds[0] ?? DEFAULT_MODEL_IDS[0];
             const defaultModelRef = `copilot-proxy/${defaultModelId}`;
 
+            const { resolveDefaultModelMaxTokens } =
+              await import("openclaw/plugin-sdk/provider-model-shared");
             return {
               profiles: [
                 {
@@ -114,7 +102,12 @@ export default definePluginEntry({
                       apiKey: DEFAULT_API_KEY,
                       api: "openai-completions",
                       authHeader: false,
-                      models: modelIds.map((modelId) => buildModelDefinition(modelId)),
+                      models: modelIds.map((modelId) =>
+                        buildModelDefinition(
+                          modelId,
+                          resolveDefaultModelMaxTokens(DEFAULT_CONTEXT_WINDOW),
+                        ),
+                      ),
                     },
                   },
                 },

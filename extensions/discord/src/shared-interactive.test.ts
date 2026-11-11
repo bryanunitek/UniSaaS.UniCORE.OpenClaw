@@ -1,4 +1,10 @@
+// Discord tests cover shared interactive plugin behavior.
+import { buildApprovalResolutionRef } from "openclaw/plugin-sdk/approval-reference-runtime";
 import { describe, expect, it } from "vitest";
+import { parseExecApprovalData } from "./approval-custom-id.js";
+import { buildDiscordActivityCustomId } from "./component-custom-id.js";
+import { buildDiscordComponentMessage } from "./components.js";
+import { parseCustomId } from "./internal/discord.js";
 import {
   buildDiscordInteractiveComponents,
   buildDiscordPresentationComponents,
@@ -44,37 +50,54 @@ describe("buildDiscordInteractiveComponents", () => {
     });
   });
 
-  it("preserves authored shared text blocks around controls", () => {
+  it("preserves opaque callback authority through the legacy renderer", () => {
     expect(
       buildDiscordInteractiveComponents({
         blocks: [
-          { type: "text", text: "First" },
           {
             type: "buttons",
-            buttons: [{ label: "Approve", value: "approve", style: "success" }],
+            buttons: [
+              {
+                label: "Unavailable",
+                action: { type: "web-app", widgetId: "invalid" },
+              },
+              {
+                label: "Continue",
+                action: { type: "callback", value: "/codex permissions yolo" },
+              },
+            ],
           },
-          { type: "text", text: "Last" },
         ],
       }),
-    ).toEqual({
+    ).toMatchObject({
       blocks: [
-        { type: "text", text: "First" },
         {
           type: "actions",
-          buttons: [{ label: "Approve", style: "success", callbackData: "approve" }],
+          buttons: [
+            {
+              label: "Continue",
+              callbackData: "/codex permissions yolo",
+              callbackDataKind: "callback",
+            },
+          ],
         },
-        { type: "text", text: "Last" },
       ],
     });
   });
 
-  it("preserves URL-only buttons as Discord link buttons", () => {
+  it("renders hosted widget actions as Discord Activity buttons", () => {
+    const widgetId = "AAAAAAAAAAAAAAAAAAAAAA";
     expect(
-      buildDiscordInteractiveComponents({
+      buildDiscordPresentationComponents({
         blocks: [
           {
             type: "buttons",
-            buttons: [{ label: "Docs", url: "https://example.com/docs" }],
+            buttons: [
+              {
+                label: "Open widget",
+                action: { type: "web-app", widgetId },
+              },
+            ],
           },
         ],
       }),
@@ -82,10 +105,214 @@ describe("buildDiscordInteractiveComponents", () => {
       blocks: [
         {
           type: "actions",
-          buttons: [{ label: "Docs", style: "link", url: "https://example.com/docs" }],
+          buttons: [
+            {
+              label: "Open widget",
+              style: "secondary",
+              internalCustomId: buildDiscordActivityCustomId(widgetId),
+            },
+          ],
         },
       ],
     });
+  });
+
+  it("renders system-agent approvals as actionable Discord controls", () => {
+    const rendered = buildDiscordPresentationComponents({
+      blocks: [
+        {
+          type: "buttons",
+          buttons: [
+            {
+              label: "Allow Once",
+              action: {
+                type: "approval",
+                approvalId: "change-1",
+                approvalKind: "system-agent",
+                decision: "allow-once",
+              },
+              value: "/approve change-1 allow-once",
+              style: "success",
+            },
+          ],
+        },
+      ],
+    });
+
+    const firstBlock = rendered?.blocks?.[0];
+    const customId =
+      firstBlock?.type === "actions" ? firstBlock.buttons?.[0]?.internalCustomId : undefined;
+    expect(customId).toBe("execapproval:kind=system-agent;id=change-1;action=allow-once");
+    expect(parseExecApprovalData(parseCustomId(customId ?? "").data)).toEqual({
+      approvalId: "change-1",
+      approvalKind: "system-agent",
+      action: "allow-once",
+    });
+  });
+
+  it("renders typed approvals as actionable transport-private Discord controls", () => {
+    const rendered = buildDiscordPresentationComponents({
+      blocks: [
+        {
+          type: "buttons",
+          buttons: [
+            {
+              label: "Deny",
+              action: {
+                type: "approval",
+                approvalId: "opaque:approval;id=7",
+                approvalKind: "plugin",
+                decision: "deny",
+              },
+              value: "/approve opaque:approval;id=7 deny",
+              style: "danger",
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(rendered).toEqual({
+      blocks: [
+        {
+          type: "actions",
+          buttons: [
+            {
+              label: "Deny",
+              style: "danger",
+              internalCustomId:
+                "execapproval:kind=plugin;id=opaque%3Aapproval%3Bid%3D7;action=deny",
+            },
+          ],
+        },
+      ],
+    });
+    const firstBlock = rendered?.blocks?.[0];
+    const customId =
+      firstBlock?.type === "actions" ? firstBlock.buttons?.[0]?.internalCustomId : undefined;
+    expect(customId).toBeDefined();
+    if (!rendered) {
+      throw new Error("Expected Discord presentation components");
+    }
+    const built = buildDiscordComponentMessage({ spec: rendered });
+    const serialized = built.components[0]?.serialize() as
+      | { components?: Array<{ components?: Array<{ custom_id?: string }> }> }
+      | undefined;
+    expect(serialized?.components?.[0]?.components?.[0]?.custom_id).toBe(customId);
+    expect(built.entries).toEqual([]);
+    expect(parseExecApprovalData(parseCustomId(customId ?? "").data)).toEqual({
+      approvalId: "opaque:approval;id=7",
+      approvalKind: "plugin",
+      action: "deny",
+    });
+  });
+
+  it("uses declared-choice indices when custom input is interleaved", () => {
+    const questionId = "ask_0123456789abcdef0123456789abcdef";
+    expect(
+      buildDiscordPresentationComponents(
+        {
+          blocks: [
+            {
+              type: "buttons",
+              buttons: [
+                {
+                  label: "Production",
+                  action: { type: "question", questionId, optionValue: "Production" },
+                },
+                {
+                  label: "Other…",
+                  action: { type: "question", questionId, intent: "custom-input" },
+                },
+                {
+                  label: "Staging",
+                  action: { type: "question", questionId, optionValue: "Staging" },
+                },
+              ],
+            },
+          ],
+        },
+        {
+          questionOptionIndices: new Map([
+            [
+              questionId,
+              new Map([
+                ["staging", 0],
+                ["production", 1],
+              ]),
+            ],
+          ]),
+        },
+      ),
+    ).toMatchObject({
+      blocks: [
+        {
+          buttons: [
+            { internalCustomId: `ocq:id=${questionId};i=1` },
+            { internalCustomId: `ocq:id=${questionId};i=0` },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("rejects malformed approval custom ids and compacts overlong canonical ids", () => {
+    expect(
+      parseExecApprovalData(parseCustomId("execapproval:kind=exec;id=%zz;action=allow-once").data),
+    ).toBeNull();
+    expect(
+      parseExecApprovalData(
+        parseCustomId("execapproval:kind=exec;id=approval-1;action=/approve").data,
+      ),
+    ).toBeNull();
+    const overlongId = `approval/${"\u{1F4F1}".repeat(40)}`;
+    const rendered = buildDiscordPresentationComponents({
+      blocks: [
+        {
+          type: "buttons",
+          buttons: [
+            {
+              label: "Review",
+              action: {
+                type: "approval",
+                approvalId: overlongId,
+                approvalKind: "exec",
+                decision: "allow-once",
+              },
+            },
+          ],
+        },
+      ],
+    });
+    const firstBlock = rendered?.blocks?.[0];
+    const customId =
+      firstBlock?.type === "actions" ? firstBlock.buttons?.[0]?.internalCustomId : undefined;
+    expect(customId?.length).toBeLessThanOrEqual(100);
+    expect(parseExecApprovalData(parseCustomId(customId ?? "").data)).toEqual({
+      approvalId: buildApprovalResolutionRef({ approvalId: overlongId, approvalKind: "exec" }),
+      approvalKind: "exec",
+      action: "allow-once",
+    });
+    expect(
+      buildDiscordPresentationComponents({
+        blocks: [
+          {
+            type: "buttons",
+            buttons: [
+              {
+                label: "Invalid",
+                action: {
+                  type: "approval",
+                  approvalId: "approval-1",
+                  approvalKind: "invalid" as "exec",
+                  decision: "allow-once",
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    ).toBeUndefined();
   });
 
   it("splits long shared button rows to stay within Discord action limits", () => {
@@ -151,38 +378,6 @@ describe("buildDiscordInteractiveComponents", () => {
               style: "secondary",
               callbackData: "/codex open",
               callbackDataKind: "command",
-            },
-          ],
-        },
-      ],
-    });
-  });
-
-  it("marks typed callback actions as opaque callback data", () => {
-    expect(
-      buildDiscordPresentationComponents({
-        blocks: [
-          {
-            type: "buttons",
-            buttons: [
-              {
-                label: "Opaque",
-                action: { type: "callback", value: "/codex permissions yolo" },
-              },
-            ],
-          },
-        ],
-      }),
-    ).toEqual({
-      blocks: [
-        {
-          type: "actions",
-          buttons: [
-            {
-              label: "Opaque",
-              style: "secondary",
-              callbackData: "/codex permissions yolo",
-              callbackDataKind: "callback",
             },
           ],
         },

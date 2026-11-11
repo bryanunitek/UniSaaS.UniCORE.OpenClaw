@@ -14,3 +14,16 @@ export function resolveGatewaySuccessPayload(frame) {
   }
   return undefined;
 }
+
+export function resolveGatewayCliPayload(frame) {
+  if (hasOwnEnvelopeField(frame, "result")) {
+    return frame.result;
+  }
+  if (hasOwnEnvelopeField(frame, "payload")) {
+    return frame.payload;
+  }
+  if (hasOwnEnvelopeField(frame, "data")) {
+    return frame.data;
+  }
+  return frame;
+}

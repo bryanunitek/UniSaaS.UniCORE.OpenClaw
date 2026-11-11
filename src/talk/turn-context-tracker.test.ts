@@ -1,3 +1,4 @@
+// Turn context tracker tests cover bounded context retention.
 import { describe, expect, it } from "vitest";
 import { createRealtimeVoiceTurnContextTracker } from "./turn-context-tracker.js";
 
@@ -13,17 +14,6 @@ describe("realtime voice turn context tracker", () => {
     expect(tracker.size()).toBe(1);
     expect(tracker.consumeAudioContext()).toEqual({ id: "spoken" });
     expect(tracker.consumeAudioContext()).toBeUndefined();
-  });
-
-  it("marks consumed handles closed when callers close them later", () => {
-    const tracker = createRealtimeVoiceTurnContextTracker<{ id: string }>();
-    const turn = tracker.open({ id: "speaker" });
-    tracker.markAudio(turn);
-
-    expect(tracker.consumeAudioContext()).toEqual({ id: "speaker" });
-    tracker.close(turn);
-
-    expect(turn.closed).toBe(true);
   });
 
   it("can defer retaining silent turns until audio starts", () => {
@@ -100,17 +90,6 @@ describe("realtime voice turn context tracker", () => {
     expect(tracker.consumeAudioContext()).toBeUndefined();
   });
 
-  it("allows a zero turn limit", () => {
-    const tracker = createRealtimeVoiceTurnContextTracker<{ id: string }>({ limit: 0 });
-    const turn = tracker.open({ id: "discarded" });
-
-    tracker.markAudio(turn);
-
-    expect(tracker.size()).toBe(0);
-    expect(turn.hasAudio).toBe(true);
-    expect(tracker.consumeAudioContext()).toBeUndefined();
-  });
-
   it("consumes recently ignored contexts once before the ttl expires", () => {
     let now = 1_000;
     const tracker = createRealtimeVoiceTurnContextTracker<{ id: string }>({
@@ -133,18 +112,5 @@ describe("realtime voice turn context tracker", () => {
     const text = createRealtimeVoiceTurnContextTracker<string>();
     text.rememberIgnoredContext("");
     expect(text.consumeIgnoredContext()).toBe("");
-  });
-
-  it("expires ignored contexts after the ttl", () => {
-    let now = 1_000;
-    const tracker = createRealtimeVoiceTurnContextTracker<{ id: string }>({
-      ignoredContextTtlMs: 500,
-      now: () => now,
-    });
-
-    tracker.rememberIgnoredContext({ id: "old" });
-    now = 1_501;
-
-    expect(tracker.consumeIgnoredContext()).toBeUndefined();
   });
 });

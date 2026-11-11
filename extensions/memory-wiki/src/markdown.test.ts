@@ -1,19 +1,30 @@
-import { createHash } from "node:crypto";
+// Memory Wiki tests cover markdown plugin behavior.
+
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  createWikiPageFilename,
+  extractHumanNotesBlock,
+  parseWikiMarkdown,
+  preserveHumanNotesBlock,
   renderWikiMarkdown,
+  scanWikiPageSummary,
   slugifyWikiSegment,
   toWikiPageSummary,
 } from "./markdown.js";
 
-describe("slugifyWikiSegment", () => {
-  it("preserves Unicode letters and numbers in wiki slugs", () => {
-    expect(slugifyWikiSegment("大语言模型概述")).toBe("大语言模型概述");
-    expect(slugifyWikiSegment("LLM 架构分析")).toBe("llm-架构分析");
-    expect(slugifyWikiSegment("Circuit Breaker 自動恢復")).toBe("circuit-breaker-自動恢復");
+function scanWikiLinkTargets(markdown: string, relativePath: string): string[] {
+  const result = scanWikiPageSummary({
+    absolutePath: path.join("/tmp/wiki", relativePath),
+    relativePath,
+    raw: markdown,
   });
+  if (result.status !== "valid") {
+    throw new Error(`Expected valid wiki page scan, got ${result.status}`);
+  }
+  return result.page.linkTargets;
+}
 
+describe("slugifyWikiSegment", () => {
   it("keeps ASCII behavior unchanged", () => {
     expect(slugifyWikiSegment("hello world")).toBe("hello-world");
     expect(slugifyWikiSegment("")).toBe("page");
@@ -24,27 +35,58 @@ describe("slugifyWikiSegment", () => {
     expect(slugifyWikiSegment("कुतुब")).toBe("कुतुब");
     expect(slugifyWikiSegment("कीताब")).toBe("कीताब");
   });
+});
 
-  it("caps long Unicode slugs to a safe filename byte length", () => {
-    const title = "漢".repeat(90);
-    const slug = slugifyWikiSegment(title);
+describe("human Notes blocks", () => {
+  const startMarker = "<!-- openclaw:human:start -->";
+  const endMarker = "<!-- openclaw:human:end -->";
+  const rendered = ["# Source", "", "## Notes", startMarker, endMarker, ""].join("\n");
 
-    expect(slug.endsWith(`-${createHash("sha1").update(title).digest("hex").slice(0, 12)}`)).toBe(
-      true,
-    );
-    expect(Buffer.byteLength(slug)).toBeLessThanOrEqual(240);
-    expect(slugifyWikiSegment(title)).toBe(slug);
+  it.each([endMarker])("ignores a standalone marker inside fenced source content", (marker) => {
+    const existing = ["# Source", "", "## Content", "```text", marker, "```", ""].join("\n");
+
+    expect(extractHumanNotesBlock(existing)).toBeNull();
+    expect(preserveHumanNotesBlock(rendered, existing)).toBe(rendered);
   });
 
-  it("caps composed wiki page filenames to a safe path-component length", () => {
-    const stem = `bridge-${"漢".repeat(45)}-${"語".repeat(45)}`;
-    const fileName = createWikiPageFilename(stem);
+  it("preserves marker comments embedded in complete human Notes", () => {
+    const notes = [
+      "Before copied markers",
+      startMarker,
+      "Between copied markers",
+      endMarker,
+      "After copied markers",
+    ].join("\n");
+    const existing = rendered.replace(
+      `${startMarker}\n${endMarker}`,
+      `${startMarker}\n${notes}\n${endMarker}`,
+    );
 
-    expect(fileName.endsWith(".md")).toBe(true);
-    expect(
-      Buffer.byteLength(`.${fileName}.00000000-0000-4000-8000-000000000000.fallback.tmp`),
-    ).toBeLessThanOrEqual(255);
-    expect(createWikiPageFilename(stem)).toBe(fileName);
+    expect(extractHumanNotesBlock(existing)).toBe(`${startMarker}\n${notes}\n${endMarker}`);
+    expect(preserveHumanNotesBlock(rendered, existing)).toBe(existing);
+  });
+
+  it.each([startMarker, endMarker])("rejects an unpaired producer-page marker %s", (marker) => {
+    const existing = `# Concept\n\n## Notes\n${marker}\nHandwritten note.\n`;
+
+    expect(() => preserveHumanNotesBlock(rendered, existing, { producerMarkdown: true })).toThrow(
+      "human Notes are missing",
+    );
+  });
+
+  it.each(["\n", "\r\n"])("preserves legacy Notes under an open producer fence (%j)", (newline) => {
+    const humanBlock = [startMarker, "Keep café and trailing spaces.  ", endMarker].join(newline);
+    const existing = `~~~sql${newline}SELECT 1${newline}## Notes${newline}${humanBlock}${newline}`;
+
+    expect(preserveHumanNotesBlock(rendered, existing, { producerMarkdown: true })).toBe(
+      rendered.replace(`${startMarker}\n${endMarker}`, () => humanBlock),
+    );
+  });
+
+  it("does not preserve a legacy producer's closed Notes example", () => {
+    const existing = `~~~markdown\n## Notes\n${startMarker}\nProducer example.\n${endMarker}\n~~~`;
+
+    expect(preserveHumanNotesBlock(rendered, existing, { producerMarkdown: true })).toBe(rendered);
   });
 });
 
@@ -145,4 +187,98 @@ describe("toWikiPageSummary", () => {
       },
     ]);
   });
+
+  it.each([{ name: "sequence", frontmatter: "- pageType: synthesis" }])(
+    "reports and excludes $name frontmatter roots from page scans",
+    ({ frontmatter }) => {
+      const raw = ["---", frontmatter, "---", "", "# Invalid Root"].join("\n");
+      const params = {
+        absolutePath: "/tmp/wiki/syntheses/invalid-root.md",
+        relativePath: "syntheses/invalid-root.md",
+        raw,
+      };
+      const result = scanWikiPageSummary(params);
+      if (result.status !== "invalid-frontmatter") {
+        throw new Error("expected invalid frontmatter result");
+      }
+
+      expect(result.error.message).toBe("Wiki frontmatter must be a YAML mapping");
+      expect(toWikiPageSummary(params)).toBeNull();
+      expect(() => parseWikiMarkdown(raw)).toThrow("Wiki frontmatter must be a YAML mapping");
+    },
+  );
+});
+
+describe("scanWikiPageSummary linkTargets", () => {
+  it("accepts a closing fence longer than the opening fence (#97945)", () => {
+    // CommonMark allows the closing fence to be the same or longer than the
+    // opening fence.  A `` ``` `` opener with a `` ```` `` closer must still
+    // strip the block so the Scala generic inside is not extracted.
+    const markdown = [
+      "# Longer Close",
+      "",
+      "```scala",
+      "def handle(req: Request[A]): Future[Option[User]] = ???",
+      "````",
+      "",
+      "Prose: [[RealTarget]]",
+    ].join("\n");
+    const links = scanWikiLinkTargets(markdown, "entities/test.md");
+    expect(links).toEqual(["RealTarget"]);
+  });
+
+  it("does not leak [[…]] when a shorter fence-like line appears inside a longer fenced block (#97945)", () => {
+    // A 6-backtick block containing a shorter 3-backtick line before the real
+    // 6-backtick close must not cause the scanner to exit early.
+    const markdown = [
+      "# Long Fence With Shorter Inner Line",
+      "",
+      "``````bash",
+      "some code",
+      "```",
+      "[[not-a-link]]",
+      "``````",
+      "",
+      "After fence: [[RealPage]]",
+    ].join("\n");
+    const links = scanWikiLinkTargets(markdown, "entities/test.md");
+    expect(links).toEqual(["RealPage"]);
+  });
+});
+
+it("decodes Markdown URL paths without changing literal wiki links or malformed escapes", () => {
+  const markdown = renderWikiMarkdown({
+    frontmatter: { pageType: "source", id: "source.links", title: "Links" },
+    body: "[Notes](../syntheses/plan%20notes.md)\n[Cafe](../syntheses/caf%C3%A9.md#menu)\n[Malformed](../syntheses/100%.md)\n[[literal%20name]]\n`[Code](hidden%20target.md)`",
+  });
+  expect(scanWikiLinkTargets(markdown, "sources/links.md")).toEqual([
+    "literal%20name",
+    "syntheses/plan notes.md",
+    "syntheses/café.md",
+    "syntheses/100%.md",
+  ]);
+});
+
+it("keeps inline link filtering while parsing CommonMark destinations", () => {
+  const markdown = [
+    "[[Wiki target|Alias]]",
+    '[Plan](../syntheses/plan(v2).md?view=full#details "Project plan")',
+    "[Escaped](../syntheses/plan\\(v3\\).md)",
+    "![Image](../assets/diagram.png)",
+    "[External](https://example.com/page.md)",
+    "[Anchor](#details)",
+    "`[Inline code](inline.md)`",
+    "```markdown\n[Fenced code](fenced.md)\n```",
+    "<!-- openclaw:wiki:related:start -->",
+    "[Generated](generated.md)",
+    "<!-- openclaw:wiki:related:end -->",
+    "[Reference][ref]\n\n[ref]: reference.md",
+  ].join("\n\n");
+
+  expect(scanWikiLinkTargets(markdown, "entities/test.md")).toEqual([
+    "Wiki target",
+    "syntheses/plan(v2).md",
+    "syntheses/plan(v3).md",
+    "assets/diagram.png",
+  ]);
 });

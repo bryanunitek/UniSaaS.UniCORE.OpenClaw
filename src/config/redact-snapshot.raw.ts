@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import JSON5 from "json5";
 
+/** Replaces known sensitive values in raw config text while preserving parseable structure. */
 export function replaceSensitiveValuesInRaw(params: {
   raw: string;
   sensitiveValues: string[];
@@ -14,23 +15,21 @@ export function replaceSensitiveValuesInRaw(params: {
     .toSorted((a, b) => b.length - a.length);
   let result = params.raw;
   for (const value of values) {
+    // Replace longer overlapping values first so a short prefix cannot hide the full secret.
     result = result.replaceAll(value, params.redactedSentinel);
   }
   return result;
 }
 
+/** Rejects raw output unless it matches the independently redacted structured view. */
 export function shouldFallbackToStructuredRawRedaction(params: {
   redactedRaw: string;
-  originalConfig: unknown;
-  restoreParsed: (parsed: unknown) => { ok: boolean; result?: unknown };
+  redactedConfig: unknown;
 }): boolean {
   try {
     const parsed = JSON5.parse(params.redactedRaw);
-    const restored = params.restoreParsed(parsed);
-    if (!restored.ok) {
-      return true;
-    }
-    return !isDeepStrictEqual(restored.result, params.originalConfig);
+    // Restoration alone would also accept an escaped secret that was never replaced.
+    return !isDeepStrictEqual(parsed, params.redactedConfig);
   } catch {
     return true;
   }

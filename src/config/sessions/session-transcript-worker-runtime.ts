@@ -171,13 +171,13 @@ export function retainSessionHistoryWorkerDatabase(
         async (admit, requestLane) => {
           try {
             const reply = await admit((requestSignal, remaining) => {
-              // A writer ahead of this read can renew the receipt during admission.
-              const validation = captureOpenClawAgentDatabaseReadValidation(
-                database,
-                owned.nativeSequences.has(requestLane) ? "retained" : "admission",
-              );
-              return runWithSqliteDatabaseAdmissionTurn([database.path], () =>
-                requestLane.pool.run(
+              return runWithSqliteDatabaseAdmissionTurn([database.path], () => {
+                // A preceding writer can renew this physical proof while admission waits.
+                const validation = captureOpenClawAgentDatabaseReadValidation(
+                  database,
+                  owned.nativeSequences.has(requestLane) ? "retained" : "admission",
+                );
+                return requestLane.pool.run(
                   () => {
                     assertCurrent();
                     options.prepareRead?.();
@@ -195,12 +195,16 @@ export function retainSessionHistoryWorkerDatabase(
                       ...input,
                       database,
                       validation: validation?.validation,
-                      projectionReceipt: projectionReceipt && {
-                        ...projectionReceipt,
-                        ...(input.kind === "history-page" && !projectionReceipt.entrySessionKey
-                          ? { contextOnly: true }
-                          : {}),
-                      },
+                      projectionReceipt:
+                        projectionReceipt &&
+                        (input.kind === "history-page"
+                          ? {
+                              ...projectionReceipt,
+                              entrySessionKey: undefined,
+                              facts: undefined,
+                              contextOnly: true,
+                            }
+                          : projectionReceipt),
                     } satisfies SessionTranscriptWorkerRequest;
                   },
                   {
@@ -231,8 +235,8 @@ export function retainSessionHistoryWorkerDatabase(
                       }
                     },
                   },
-                ),
-              );
+                );
+              });
             });
             await retirement;
             const received =
@@ -245,8 +249,7 @@ export function retainSessionHistoryWorkerDatabase(
                 received.kind === "session-cleanup" ||
                 received.kind === "session-exact-entries" ||
                 received.kind === "session-entry-current" ||
-                received.kind === "session-runtime-target" ||
-                received.kind === "session-diagnostic-text") &&
+                received.kind === "session-runtime-target") &&
               received.source
             ) {
               knownSource = true;

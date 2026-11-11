@@ -18,6 +18,7 @@ import { readOpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db
 import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { hasSessionPendingInputsSchema } from "../../state/openclaw-agent-pending-inputs-schema.js";
 import { getSessionKysely, type ResolvedTranscriptScope } from "./session-accessor.sqlite-scope.js";
+import { MAX_SESSION_ACTOR_COMPLETIONS } from "./session-actor-hydration.types.js";
 import { runWithSessionActorStorage } from "./session-actor-storage-binding.js";
 import {
   readSessionActorTransactionState,
@@ -310,17 +311,18 @@ export function readSessionInputCompletion(
   scope: SessionInputCompletionScope,
 ): SessionInputCompletion | undefined {
   const actor = readSessionActorTransactionState(database, scope);
-  const row = actor
-    ? actor.completions.get(scope.idempotencyKey)
-    : executeSqliteQueryTakeFirstSync(
-        database.db,
-        getSessionKysely(database.db)
-          .selectFrom("session_input_completions")
-          .selectAll()
-          .where("session_key", "=", scope.sessionKey)
-          .where("session_id", "=", scope.sessionId)
-          .where("idempotency_key", "=", scope.idempotencyKey),
-      );
+  let row = actor?.completions.get(scope.idempotencyKey);
+  if (!row && !actor?.completionsComplete) {
+    row = executeSqliteQueryTakeFirstSync(
+      database.db,
+      getSessionKysely(database.db)
+        .selectFrom("session_input_completions")
+        .selectAll()
+        .where("session_key", "=", scope.sessionKey)
+        .where("session_id", "=", scope.sessionId)
+        .where("idempotency_key", "=", scope.idempotencyKey),
+    );
+  }
   if (!row) {
     return undefined;
   }
@@ -389,6 +391,10 @@ export function writeSessionInputCompletion(
       succeeded: succeeded ? 1 : 0,
       completed_at: completedAt,
     });
+    if (actor.completions.size > MAX_SESSION_ACTOR_COMPLETIONS) {
+      actor.completions.delete(actor.completions.keys().next().value!);
+      actor.completionsComplete = false;
+    }
   }
   if (isFinalInputCompletion(outcome)) {
     // Handled hooks can finish without appending a user message. The completion
@@ -478,7 +484,10 @@ export function readSessionPendingInputByKey(
   const actor = readSessionActorTransactionState(database, scope);
   if (actor) {
     const row = actor.pendingInputs.get(idempotencyKey);
-    return row && { ...row };
+    if (row) {
+      return { ...row };
+    }
+    // The resident map covers unconsumed custody, not retained source history.
   }
   if (!hasSessionPendingInputsSchema(database.db)) {
     return undefined;
@@ -577,7 +586,7 @@ export function resolveSessionPendingInputAppend(
   if (owner.sources) {
     const actor = readSessionActorTransactionState(database, scope);
     const acceptedByKey = new Map(
-      (actor
+      (actor && owner.sources.every((source) => actor.pendingInputs.has(source.idempotencyKey))
         ? owner.sources.flatMap((source) => {
             const accepted = actor.pendingInputs.get(source.idempotencyKey);
             return accepted ? [{ ...accepted }] : [];
@@ -692,11 +701,8 @@ export function consumeSessionPendingInput(
         continue;
       }
       actor.pendingInputs = writableSessionActorMap(actor.pendingInputs);
-      if (pending.sourceInputIds) {
-        actor.pendingInputs.set(key, { ...row, consumed_event_id: pending.inputId });
-      } else {
-        actor.pendingInputs.delete(key);
-      }
+      // Retain source receipts in SQLite only; replay uses the indexed reader.
+      actor.pendingInputs.delete(key);
     }
   }
   // Outer commit publishes this fact before observers; rollback leaves finish responsible.

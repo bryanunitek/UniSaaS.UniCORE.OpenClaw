@@ -22,9 +22,11 @@ import {
 import type { ManagedHandoffRepair } from "../../infra/update-managed-service-handoff-lease-types.js";
 import { POST_CORE_UPDATE_SOURCE_CONFIG_PATH_ENV } from "../../infra/update-post-core-context.js";
 import { formatUpdateRunOwnership } from "../../infra/update-run-activity.js";
+import { findUpdateGatewayStop } from "../../infra/update-run-gateway-stop.js";
 import {
   acknowledgeAbandonedUpdateRun,
   getUpdateRun,
+  listUpdateRuns,
   reconcileAbandonedUpdateRunsAsync,
 } from "../../infra/update-run-ledger.js";
 import { assertUpdateRecoveryAdmission } from "../../infra/update-run-recovery-admission.js";
@@ -58,6 +60,7 @@ import {
   readPostCorePreUpdateSourceConfig,
   readUpdateConfigFileSnapshot,
 } from "./update-command-config.js";
+import { withUpdateCommandExecutor } from "./update-command-executor.js";
 import {
   completePostCorePluginUpdate,
   runUpdateFinalizationDoctorInFreshProcess,
@@ -86,11 +89,18 @@ import {
   UpdateFinalizationLifecycle,
   type UpdateFinalizationPhase,
 } from "./update-finalization-lifecycle.js";
+import { restoreRepairGateway } from "./update-repair-service.js";
+import {
+  reportRetainedUpdateCustody,
+  type RetainedUpdateCustodyReport,
+} from "./update-retained-custody.js";
 
 export async function updateFinalizeCommand(
   opts: UpdateFinalizeOptions,
   recoveryRunIds?: readonly string[],
   handoff?: ManagedHandoffRepair,
+  // Finalization can succeed while repair-retained custody still blocks the next update.
+  retained?: RetainedUpdateCustodyReport,
 ): Promise<void> {
   // Refuse retained recovery before discovery; preflight rechecks before state writes.
   await assertUpdateRecoveryAdmission({ env: process.env });
@@ -179,9 +189,13 @@ export async function updateFinalizeCommand(
                   recoveryRunIds ?? [],
                   runId,
                   recoveryRunIds !== undefined || lifecycle.ownsUpdateRun,
+                  retained,
                 );
               });
               await complete();
+              if (retained && recoveryRunIds !== undefined && lifecycle.ownsUpdateRun) {
+                exitCode = 2;
+              }
             } catch (error) {
               if (hasCommandProcessCleanupError(error)) {
                 throw error;
@@ -196,19 +210,33 @@ export async function updateFinalizeCommand(
                 ]);
                 lifecycle.recordWarnings(warnings);
                 defaultRuntime.error(warnings[0]);
+                // A failed repair claim still stands in for the cancelled custody.
+                const custody =
+                  retained ??
+                  (handoff?.cancelledCustody
+                    ? reportRetainedUpdateCustody({
+                        ...handoff.cancelledCustody,
+                        reason:
+                          "Doctor maintenance remains pending; this repair keeps its claim on the cancelled custody until a later repair completes.",
+                      })
+                    : undefined);
+                const reportedNextAction = custody
+                  ? `${nextAction} ${custody.nextAction}`
+                  : nextAction;
                 if (opts.json) {
                   defaultRuntime.writeJson({
                     status: "warning",
-                    nextAction,
+                    nextAction: reportedNextAction,
                     mode: "finalize",
                     root,
                     restart: false,
                     phaseTimings: lifecycle.phaseTimings,
                     postUpdate: { doctor: { status: "warning", warnings } },
+                    ...(custody ? { retainedUpdateCustody: custody.retainedUpdateCustody } : {}),
                   });
                 } else {
                   defaultRuntime.log(
-                    theme.warn(`Doctor maintenance remains pending. ${nextAction}`),
+                    theme.warn(`Doctor maintenance remains pending. ${reportedNextAction}`),
                   );
                 }
                 lifecycle.complete(0, nextAction);
@@ -320,8 +348,12 @@ async function updateFinalizeCommandInternal(
   recoveryRunIds: readonly string[],
   invokingRunId: string,
   ownsMaintenance: boolean,
+  retained?: RetainedUpdateCustodyReport,
 ): Promise<() => Promise<void>> {
   const { root, nodeRunner, preFinalizeConfig, requestedChannel, channel } = prepared;
+  const interruptedGateway = recoveryRunIds.length
+    ? findUpdateGatewayStop(listUpdateRuns({ limit: 100 }))
+    : undefined;
   let doctorWarnings: string[] = [];
   const onDoctorWarnings = (warnings: string[]) => {
     doctorWarnings = normalizeUpdatePostInstallDoctorWarnings([...doctorWarnings, ...warnings]);
@@ -471,12 +503,42 @@ async function updateFinalizeCommandInternal(
       (result) => result,
     );
 
+    const gateway =
+      interruptedGateway && pluginUpdate.status !== "error" && !retained
+        ? await lifecycle.run("gatewayRestoration", async (phase) => {
+            const restore = (assertCurrent: () => void) =>
+              restoreRepairGateway({
+                originalRunId: interruptedGateway.runId,
+                repairRunId: invokingRunId,
+                root,
+                config: configSnapshot.config,
+                env: resolveServiceRefreshEnv(process.env, tryProcessCwd()),
+                json: Boolean(opts.json),
+                phase: { ...phase, assertCurrent },
+                timeoutMs: lifecycle.budget("gatewayRestoration"),
+              });
+            if (lifecycle.handoff) {
+              return await restore(phase.assertCurrent);
+            }
+            return await withUpdateCommandExecutor(invokingRunId, async (executor) => {
+              const fence = await executor.enter(root);
+              return await restore(() => {
+                phase.assertCurrent();
+                fence.assertCurrent();
+              });
+            });
+          })
+        : undefined;
+    if (gateway?.warning) {
+      onDoctorWarnings([gateway.warning]);
+    }
+
     const reconciledRuns: string[] = [];
     const result = {
       status:
         pluginUpdate.status === "error"
           ? "error"
-          : pluginUpdate.status === "warning" || doctorWarnings.length > 0
+          : pluginUpdate.status === "warning" || doctorWarnings.length > 0 || retained
             ? "warning"
             : "ok",
       mode: "finalize",
@@ -487,8 +549,10 @@ async function updateFinalizeCommandInternal(
           ? normalizeUpdateChannel(configSnapshot.config.update?.channel)
           : null) ??
         channel,
-      restart: false,
+      restart: gateway?.restart ?? false,
+      ...(gateway?.verification ? { verification: gateway.verification } : {}),
       ...(recoveryRunIds.length ? { reconciledRuns } : {}),
+      ...retained,
       phaseTimings: lifecycle.phaseTimings,
       postUpdate: {
         doctor: {
@@ -543,8 +607,16 @@ async function updateFinalizeCommandInternal(
           defaultRuntime.log(theme.muted("Update finalization completed."));
         } else if (result.status === "warning") {
           defaultRuntime.log(theme.warn("Update finalization completed with warnings."));
+          if (retained) {
+            defaultRuntime.log(theme.warn(retained.nextAction));
+          }
         } else {
           defaultRuntime.log(theme.error("Update finalization failed."));
+        }
+        if (!opts.json && gateway?.verification) {
+          defaultRuntime.log(
+            `Managed Gateway ${gateway.restart ? "started and " : ""}verified after update repair.`,
+          );
         }
         lifecycle.complete(result.status === "error" ? 1 : 0);
         if (failure) {

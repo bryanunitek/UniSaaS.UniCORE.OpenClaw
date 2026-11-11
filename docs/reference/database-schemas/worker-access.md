@@ -60,8 +60,10 @@ transaction custody.
 
 Gateway startup binds existing auth-file observers to its read-only scope and
 spawn broker, including observations retained across an in-process restart.
-New observers capture those resources when admitting a directory. File scans
-publish through the current binding, including scans spanning a restart.
+New observers reuse that binding even when a temporary request admits their
+directory later. Without a Gateway binding, observers capture their caller's
+resources. File scans publish through the current binding, including scans
+spanning a restart.
 Filesystem notifications retire physical replacements and changed legacy sources;
 ordinary database and WAL contents changes do not reload auth rows. Scope retirement
 stops change publications, and the next Gateway generation rebinds retained observers
@@ -145,6 +147,12 @@ tracked DDL and rollback invalidate the catalog before subsequent reads. Schema
 preparation runs under Gateway or exclusive offline ownership, so it does not
 repeat its preflight reads inside the creation transaction. Integrity checks,
 agent ownership checks, and destructive cleanup authority remain in place.
+
+Catalog admission alone does not mean the agent schema exists. Session target
+discovery joins any pending first preparation owned by the agent's native
+execution owner before inspecting that catalog. This covers new databases and
+interrupted empty files without making Gateway readiness depend on every lazy
+agent store. Canceling a discovery request stops its wait, not schema preparation.
 
 The Gateway is the single runtime owner of its databases. Load physical format,
 schema, integrity, and canonical-index facts through the shared admission owner,
@@ -286,6 +294,10 @@ hot state inside the existing agent writer queue. The main thread keeps an
 immutable receipt-maintained replica, shared across short-lived caller handles.
 A cold actor hydrates entry, membership, pending-input custody, and transcript
 metadata in one statement; a cold mutation hydrates inside its own transaction.
+Pending-input hot state contains only unconsumed custody. Consumed source receipts
+remain in SQLite and use indexed exact-key reads for replay; an absent hot row
+does not prove an input is new. Consumption removes source rows from resident
+state without deleting their durable receipts or changing retention.
 Warm readers use the replica. Complete committed postimages install before the
 command acknowledgement; eviction, replacement, incomplete coverage, and unknown
 outcomes return reads to the canonical worker. Bounded transcript payload reads
@@ -557,6 +569,12 @@ Source preparation borrows an already-retained entry predicate instead of dispat
 another exact-entry read. Releasing a mutation's source leaves its selecting reader
 current; releasing that reader revokes every borrower. The destination worker keeps
 its transaction-local source comparison before the effect.
+
+During initial selection, the publication owner retains concurrent committed row
+facts and compares them with the selecting read before granting authority. A
+metadata-only change does not invalidate an unchanged policy. Once selected,
+policy or lifecycle changes still revoke the prepared check, independently of
+unrelated agent deletion and topology publications.
 
 Bundled native harnesses prepare session lineage once and retain the same entry
 predicate through terminal cleanup. Final lineage checks use published facts;
@@ -3496,7 +3514,9 @@ migration owner, and missing required tables at the current schema remain an
 admission error.
 
 Durable entry deletion can carry prepared Agents API and Codex binding participants
-through the same executing worker. Binding deletion still commits in shared state
+through the same executing worker. Empty-entry deletion prepares the native binding
+codec in that worker before transaction entry, just like archive reclamation.
+Binding deletion still commits in shared state
 before the agent transaction commits, and can veto that transaction. Confirmed agent
 rollback conditionally restores the actual removed binding without replacing a
 successor. Binding renewal continues during queue waits, drains before transaction

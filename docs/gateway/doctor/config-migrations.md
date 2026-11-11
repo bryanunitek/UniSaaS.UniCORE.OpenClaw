@@ -18,6 +18,15 @@ Doctor keeps plugin repair and diagnostic contracts available through later heal
 checks and service finalization. It releases its private plugin resources when
 the flow ends, including failed runs.
 
+## Group allowlist fallback
+
+For channels that support legacy DM sender fallback, Doctor copies `allowFrom`
+into an absent `groupAllowFrom`. It preserves explicit lists, including `[]`, at
+channel and account scope, and accounts keep inherited explicit channel lists.
+The migration also leaves lists absent when the effective account, channel, or
+global-default `groupPolicy` disables groups. Explicit policy overrides still
+apply. Update-time Doctor repair follows the same rules.
+
 ## Cloud setup secret migration
 
 The Crabbox plugin retires `cloudWorkers.profiles.<id>.settings.setupEnv`.
@@ -706,6 +715,21 @@ and differing selections are both supported configurations. This notice proposes
 no repair and does not rewrite the config; ACP turns keep their configured harness
 selection.
 
+## Saved model output caps
+
+OpenClaw's default output cap for a model with no authored, provider, or catalog
+`maxTokens` is 32768 tokens, or half the context window when that window is below
+65,536 tokens (never below 8192 unless the window is smaller). Earlier releases used
+8192, and onboarding saved 4096 (custom-provider wizard) or 8192 (self-hosted setup)
+into model rows.
+
+Doctor reports model rows under `models.providers.*.models` that still pin
+`maxTokens` to 4096 or 8192 as information (`core/doctor/legacy-output-cap`), grouped
+per provider, when removing the value would raise the cap. It skips providers with a
+provider-level `maxTokens` and Mistral, whose 8192 cap is intentional. A saved cap may
+be deliberate, so Doctor proposes no repair and never rewrites it: remove `maxTokens`
+from those rows to use the catalog limit or the new default.
+
 ## Missing plugins during migration
 
 Doctor owns deferred plugin migrations. Normal CLI commands, Gateway startup,
@@ -1010,7 +1034,7 @@ against the current SQLite owners before the import can rename profiles.
 
     A tool policy scope with nonempty `allow` and `alsoAllow` lists fails validation. `doctor --fix` merges the lists only when the effective profile grants remain unchanged for every agent and provider that inherits the extras. It retains `alsoAllow: []` as an explicit override so inherited extras cannot reappear. If the extras may extend a profile or grant Gateway configuration-read access, Doctor leaves the conflicting scope untouched and reports the exact keys and values to review manually. This applies at the root `tools` policy, per-agent and per-provider policies, and channel or gateway tool policies. Sandbox lists remain untouched because `allow` and `alsoAllow` inherit independently; conflicting sandbox lists still require manual repair. Plugin-owned `plugins.entries.*.config` is left to the owning plugin's doctor contract. Gateway startup leaves these conflicts unchanged and directs the operator to Doctor; unresolved conflicts still require operator guidance before the config can validate.
 
-    `doctor --fix` removes `workspace: null` from `agents.entries.<id>` so normal workspace resolution can apply. It also removes invalid `heartbeat.activeHours` windows from agent entries and `agents.defaults`, preserving other heartbeat settings. Reconfigure a valid window if needed; without an explicit or inherited window, heartbeat hours are unrestricted. These repairs also apply after migrating a legacy `agents.list` roster.
+    `doctor --fix` removes `workspace: null` from `agents.entries.<id>` so normal workspace resolution can apply. Invalid `heartbeat.activeHours` windows in agent entries and `agents.defaults` stay unchanged and invalid: Doctor reports the exact field and value instead of falling back to inherited or unrestricted hours. Correct the reported window to valid `HH:MM` values, then rerun `openclaw doctor --fix`. These repairs also apply after migrating a legacy `agents.list` roster.
 
   </Accordion>
   <Accordion title="2. Legacy config key migrations">

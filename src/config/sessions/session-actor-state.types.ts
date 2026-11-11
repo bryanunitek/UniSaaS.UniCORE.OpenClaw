@@ -5,7 +5,10 @@ import type {
   SessionTranscriptContextVersion,
   SessionTranscriptWatermark,
 } from "./session-transcript-context-version.types.js";
-import type { SessionTranscriptProjectionFacts } from "./session-transcript-projection-facts.types.js";
+import type {
+  SessionTranscriptContextStats,
+  SessionTranscriptProjectionFacts,
+} from "./session-transcript-projection-facts.types.js";
 import type { TranscriptEntryAnchor } from "./transcript-entry-anchor.js";
 import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
@@ -57,12 +60,14 @@ export type SessionActorHotState = {
   hasBoard: boolean;
   participants: SessionParticipantRecord[];
   members: SessionMember[];
+  /** Durable actors expose unconsumed custody only, not retained source history. */
   pendingInputs: Array<Omit<SessionPendingInputRow, "message_json">>;
   /** Retry-key membership is complete only with resident modelContext. */
   completionKeys: string[];
   transcript: {
     /** Durable projection postimage; omitted by adapters without SQLite projections. */
     projection?: SessionTranscriptProjectionFacts;
+    contextStats?: SessionTranscriptContextStats;
     watermark: SessionTranscriptWatermark;
     version: SessionTranscriptContextVersion;
     /** Empty anchors prove absence only when this exact projection is resident. */
